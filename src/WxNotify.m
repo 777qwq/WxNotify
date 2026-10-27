@@ -40,14 +40,13 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.16"
+#define WXN_VERSION     "2.17"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
-#define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
-#define WXN_DIAG_NOT    "cn.qwq.wxnotify.diag"
+// 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
+#define WXN_DEBUG_MARK  "/var/mobile/Library/Preferences/cn.qwq.wxnotify.debug"
 // 2.12：SpringBoard 侧守卫写的真·最前台状态
 #define WXN_FRONT_PATH  "/var/mobile/Library/Preferences/cn.qwq.wxnotify.front"
-#define WXN_DEACT_NOT   "cn.qwq.wxnotify.deact"      // 场景被停用时广播一下（调试用）
 
 // 通知里显示的内容上限，防止超长消息把横幅撑爆
 #define WXN_BODY_MAX    240
@@ -68,13 +67,6 @@ typedef struct {
 
 static WXNConfig gCfg;
 static pthread_mutex_t gCfgLock = PTHREAD_MUTEX_INITIALIZER;
-
-// 微信 scene 的"被停用"信号：真的切去别的 App、上滑回桌面时才会出现。
-// 沙盒里问不到最前台是谁（SBS 那条路返回 nil），这条是唯一不靠猜的线索。
-// gSceneKnown=0 表示一次都没收到过（比如被 Immortalizer 全抹了），那就退回触摸判断。
-static volatile BOOL gSceneKnown = NO;
-static volatile BOOL gSceneAway = NO;
-static volatile unsigned long long gLastDeactReasons = 0;
 
 // 「假装在后台」：只在消息到达的那一小段时间里，让微信读到 Background，
 // 它就会走自己那条原生通知分支（标题/正文/角标/提示音/免打扰全是原生的）。
@@ -127,6 +119,10 @@ static NSString *WXNLogPath(void) {
 }
 
 static void WXNLog(NSString *fmt, ...) {
+    // 2.17：日志默认关。要开就在 plist 里写 debug=true，
+    // 或者在 Preferences 下放一个空文件 cn.qwq.wxnotify.debug。
+    if (!WXNDebug()) return;
+
     va_list ap;
     va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -185,7 +181,10 @@ static void WXNLoadConfig(void) {
     // 2.0 的实测结论：微信那条通知链路不看 applicationState，假装后台没叫醒它。
     // 代码留着当实验开关，默认关，免得白等 1.2 秒。
     c.nativeNotify = d[@"nativeNotify"] ? [d[@"nativeNotify"] boolValue] : NO;
-    c.debug       = d[@"debug"]       ? [d[@"debug"] boolValue]       : YES;
+    // 日志默认关。想开：plist 里 debug=true，或者放一个空文件
+    // /var/mobile/Library/Preferences/cn.qwq.wxnotify.debug（Filza 里新建就行）
+    if (d[@"debug"]) c.debug = [d[@"debug"] boolValue];
+    else c.debug = [[NSFileManager defaultManager] fileExistsAtPath:@WXN_DEBUG_MARK];
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
@@ -415,58 +414,6 @@ static BOOL WXNIsMuted(id msgMgr, id wrap) {
 // 和"被保活但人在别的 App"。所以再问一次 SpringBoard 谁在最前面。
 // ---------------------------------------------------------------------------
 
-typedef CFStringRef (*WXNCopyFrontmostFn)(void);
-
-static WXNCopyFrontmostFn WXNFrontmostFn(void) {
-    static WXNCopyFrontmostFn fn;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
-        if (!h) {
-            WXN_ALOG(@"SpringBoardServices dlopen 失败：%s", dlerror() ?: "(无信息)");
-            h = dlopen("/usr/lib/libSpringBoardServices.dylib", RTLD_LAZY);
-        }
-        if (!h) WXN_ALOG(@"libSpringBoardServices.dylib 也打不开");
-        if (h) {
-            fn = (WXNCopyFrontmostFn)dlsym(h, "SBSCopyFrontmostApplicationDisplayIdentifier");
-            if (!fn) WXN_ALOG(@"找不到 SBSCopyFrontmostApplicationDisplayIdentifier 符号");
-        }
-    });
-    return fn;
-}
-
-// 只是诊断用：看看 scene 到底被 Immortalizer 糊成什么样了
-static NSString *WXNSceneInfo(void) {
-    NSMutableString *s = [NSMutableString string];
-    @try {
-        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            [s appendFormat:@"%@/%ld ", NSStringFromClass(object_getClass(sc)),
-                              (long)sc.activationState];
-        }
-    } @catch (__unused NSException *e) {
-    }
-    return s.length ? s : @"(没有 scene)";
-}
-
-static NSString *WXNCurrentFrontmostBundle(void) {
-    WXNCopyFrontmostFn fn = WXNFrontmostFn();
-    if (!fn) return nil;
-    NSString *bundle = nil;
-    @try {
-        CFStringRef s = fn();
-        bundle = s ? CFBridgingRelease(s) : nil;
-    } @catch (__unused NSException *e) {
-        bundle = nil;
-    }
-    return bundle;
-}
-
-static BOOL WXNAppIsFrontmost(void) {
-    NSString *b = WXNCurrentFrontmostBundle();
-    if (!b) return NO; // 问不到就当作"不在前台"，宁可多弹
-    return [b isEqualToString:@WXN_BUNDLE_ID];
-}
-
 // 锁屏状态：SpringBoard 一直在广播这一位，沙盒里也读得到
 static BOOL WXNDeviceLocked(void) {
     static int tok = -1;
@@ -599,7 +546,6 @@ static void WXNSetupPresentationHooks(void);
 static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig);
 static void WXNBeginFakeBackground(NSString *why);
 static void WXNEndFakeBackground(NSString *why);
-static void WXNDumpDelivered(NSString *tag);
 
 // 微信的富消息（表情/图片/链接）正文是 XML，直接当通知正文会很难看
 static NSString *WXNCleanBody(NSString *s, unsigned int type) {
@@ -852,13 +798,7 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
         addNotificationRequest:req
              withCompletionHandler:^(NSError *error) {
                  if (error) WXN_ALOG(@"投递失败 %@: %@", identifier, error);
-                 else {
-                     WXN_LOG(@"已投递 %@", identifier);
-                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                                    dispatch_get_main_queue(), ^{
-                                        WXNDumpDelivered(identifier);
-                                    });
-                 }
+                 else WXN_LOG(@"已投递 %@", identifier);
              }];
 }
 
@@ -875,114 +815,13 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
 // 不能只存一份，因为同一个选择器可能被好几个类各自实现，调用时得找回"这一个实例"的上一层。
 static NSMutableDictionary *gSceneOrig = nil;
 
-static NSString *WXNSelKey(Class c, SEL sel) {
-    return [NSString stringWithFormat:@"%s|%s", class_getName(c), sel_getName(sel)];
-}
-
 // 从实例的真实类往上找：谁是我们接管的，就返回它原来的 IMP
-static IMP WXNOrigFor(id self, SEL _cmd) {
-    Class c = object_getClass(self);
-    while (c) {
-        NSValue *v = [gSceneOrig objectForKey:WXNSelKey(c, _cmd)];
-        if (v) return (IMP)[v pointerValue];
-        c = class_getSuperclass(c);
-    }
-    return NULL;
-}
-
 static NSTimeInterval gLastSceneLogAt = 0;
-
-static void WXNNoteDeactReasons(unsigned long long r, NSString *where) {
-    BOOL changed = NO;
-    if (r) {
-        if (!gSceneAway) {
-            WXN_ALOG(@"场景停用：reasons=0x%llx（%@）", r, where);
-            changed = YES;
-        }
-        gSceneAway = YES;
-        gLastDeactReasons = r;
-    } else {
-        if (gSceneAway) {
-            WXN_ALOG(@"场景恢复：reasons=0（%@）", where);
-            changed = YES;
-        }
-        gSceneAway = NO;
-        gLastDeactReasons = 0;
-    }
-    gSceneKnown = YES;
-    // 值没变也要偶尔记一次，好让用户切完屏回来能看见"确实进过这里"
-    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (!changed && now - gLastSceneLogAt > 3.0) {
-        WXN_ALOG(@"场景回调：reasons=0x%llx（%@）", r, where);
-    }
-    gLastSceneLogAt = now;
-}
-
-static void WXNSetDeactReasons(id self, SEL _cmd, unsigned long long reasons) {
-    @try { WXNNoteDeactReasons(reasons, @"setDeactivationReasons"); } @catch (__unused NSException *e) {}
-    IMP o = WXNOrigFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, unsigned long long))o)(self, _cmd, reasons);
-}
-
-static void WXNUpdateSettings(id self, SEL _cmd, id settings, id ctx, id completion) {
-    @try {
-        SEL sel = NSSelectorFromString(@"deactivationReasons");
-        if (settings && [settings respondsToSelector:sel]) {
-            unsigned long long r = ((unsigned long long (*)(id, SEL))objc_msgSend)(settings, sel);
-            WXNNoteDeactReasons(r, @"updateSettings");
-        }
-    } @catch (__unused NSException *e) {}
-    IMP o = WXNOrigFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, settings, ctx, completion);
-}
 
 // 在运行时里把"自己实现了这个方法"的类全部接管。
 // 只认自己的方法列表（不认继承来的），这样每个类只挂一次，且子类实例调用时
 // WXNOrigFor 一路往上找一定能找到对应的原实现。
-static NSArray *WXNDeepSwizzle(NSString *selName, IMP replacement) {
-    NSMutableArray *names = [NSMutableArray array];
-    SEL sel = NSSelectorFromString(selName);
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return names;
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = classes[i];
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(c, &mc);
-        BOOL own = NO;
-        for (unsigned int j = 0; j < mc; j++) {
-            if (sel_isEqual(method_getName(ms[j]), sel)) { own = YES; break; }
-        }
-        free(ms);
-        if (!own) continue;
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        IMP cur = method_getImplementation(m);
-        if (cur == replacement) continue;              // 已经是我们的，别自己套自己
-        NSString *key = WXNSelKey(c, sel);
-        if (![gSceneOrig objectForKey:key]) {          // 只记最原始的那个 IMP
-            [gSceneOrig setObject:[NSValue valueWithPointer:cur] forKey:key];
-        }
-        method_setImplementation(m, replacement);
-        [names addObject:NSStringFromClass(c)];
-    }
-    free(classes);
-    return names;
-}
-
 // 可以反复调用：后来才加载的类、以及被别人又盖回去的方法，都会被重新接管
-static void WXNInstallSceneProbe(void) {
-    if (!gSceneOrig) gSceneOrig = [NSMutableDictionary dictionary];
-    NSArray *a = WXNDeepSwizzle(@"setDeactivationReasons:", (IMP)WXNSetDeactReasons);
-    NSArray *b = WXNDeepSwizzle(@"updateSettings:withTransitionContext:completion:",
-                                (IMP)WXNUpdateSettings);
-    if (a.count || b.count) {
-        WXN_ALOG(@"场景探针：本次接管 settings %lu 个[%@] scene %lu 个[%@]",
-                 (unsigned long)a.count, [a componentsJoinedByString:@","] ?: @"-",
-                 (unsigned long)b.count, [b componentsJoinedByString:@","] ?: @"-");
-    }
-}
-
 static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
                        NSString *thread, NSString *senderUsr, BOOL isGroup) {
     if (!gFakeBG) {
@@ -1237,16 +1076,6 @@ static void WXNMsgHook2B(id self, SEL _cmd, id a1, BOOL flag) {
 }
 
 // 投递后把系统里当前存在的通知 id 抄一份，用来分清屏上的第二张横幅是谁的
-static void WXNDumpDelivered(NSString *tag) {
-    [[UNUserNotificationCenter currentNotificationCenter]
-        getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> *list) {
-            NSMutableArray<NSString *> *ids = [NSMutableArray array];
-            for (UNNotification *n in list) [ids addObject:n.request.identifier];
-            WXN_ALOG(@"[已送达] %@ 之后2秒，系统里共 %lu 条：%@", tag, (unsigned long)ids.count,
-                     [ids componentsJoinedByString:@" | "] ?: @"(空)");
-        }];
-}
-
 static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
     SEL sel = NSSelectorFromString(selName);
     Method m = class_getInstanceMethod(cls, sel);
@@ -1278,7 +1107,7 @@ static BOOL gForceNextBanner = NO;
 
 static BOOL WXNForcePresentation(void) {
     if (gForceNextBanner) return YES;
-    return !WXNAppIsFrontmost();
+    return !WXNInWeChatSafe(NULL);
 }
 
 static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
@@ -1386,29 +1215,12 @@ static NSInteger WXNAppState(id self, SEL _cmd) {
     return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
 }
 
-static void (*gOrigPresentLocal)(id, SEL, id);
-static void (*gOrigScheduleLocal)(id, SEL, id);
-
-static void WXNPresentLocal(id self, SEL _cmd, id note) {
-    __sync_fetch_and_add(&gNativePosts, 1);
-    @try { WXN_ALOG(@"[微信自己投递·local] %@", note); } @catch (__unused NSException *e) {}
-    if (gOrigPresentLocal) gOrigPresentLocal(self, _cmd, note);
-}
-
-static void WXNScheduleLocal(id self, SEL _cmd, id note) {
-    __sync_fetch_and_add(&gNativePosts, 1);
-    @try { WXN_ALOG(@"[微信自己投递·local 定时] %@", note); } @catch (__unused NSException *e) {}
-    if (gOrigScheduleLocal) gOrigScheduleLocal(self, _cmd, note);
-}
-
 static void WXNInstallFakeBG(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         Class app = NSClassFromString(@"UIApplication");
         if (!app) { WXN_ALOG(@"假装后台：找不到 UIApplication"); return; }
         BOOL ok = WXNSwizzle(app, @"applicationState", (IMP)WXNAppState, &gOrigAppState);
-        WXNSwizzle(app, @"presentLocalNotificationNow:", (IMP)WXNPresentLocal, &gOrigPresentLocal);
-        WXNSwizzle(app, @"scheduleLocalNotification:", (IMP)WXNScheduleLocal, &gOrigScheduleLocal);
         WXN_ALOG(@"假装后台：applicationState 接管%@", ok ? @"成功" : @"失败");
     });
 }
@@ -1427,10 +1239,6 @@ static void WXNInstallFakeBG(void) {
 static id gLN = nil;
 static Ivar gLNIsBG = NULL;
 static void (*gOrigLNInit)(id, SEL);
-static void (*gOrigLNEnterBG)(id, SEL);
-static void (*gOrigLNEnterFG)(id, SEL);
-static void (*gOrigLNShowPush)(id, SEL, id, BOOL);
-static void (*gOrigLNShowPush2)(id, SEL, id, id, BOOL);
 static void (*gOrigLNShowPush3)(id, SEL, id, id, id, BOOL, BOOL);
 
 static void WXNGrabLN(id self) {
@@ -1476,51 +1284,8 @@ static BOOL (*gOrigAppMonitorBG)(id, SEL);
 static id (*gOrigGetService)(id, SEL, Class);
 static double gLastStateDump = 0;
 
-static BOOL WXNStateName(const char *n) {
-    if (!n) return NO;
-    NSString *low = [[NSString stringWithUTF8String:n] ?: @"" lowercaseString];
-    return [low containsString:@"active"] || [low containsString:@"background"] ||
-           [low containsString:@"foreground"] || [low containsString:@"inback"];
-}
-
 // 把对象上所有“状态类”的布尔字段读一遍，看微信到底认为自己在哪
-static void WXNDumpState(id obj, NSString *tag) {
-    if (!obj) return;
-    Class c = object_getClass(obj);
-    NSMutableArray *out = [NSMutableArray array];
-    unsigned int n = 0;
-    Ivar *ivars = class_copyIvarList(c, &n);
-    for (unsigned int i = 0; i < n; i++) {
-        const char *nm = ivar_getName(ivars[i]);
-        if (!WXNStateName(nm)) continue;
-        const char *tp = ivar_getTypeEncoding(ivars[i]);
-        if (!tp || (tp[0] != 'c' && tp[0] != 'B')) {
-            [out addObject:[NSString stringWithFormat:@"%s(非布尔)", nm]];
-            continue;
-        }
-        BOOL v = *(BOOL *)((char *)(__bridge void *)obj + ivar_getOffset(ivars[i]));
-        [out addObject:[NSString stringWithFormat:@"%s=%d", nm, (int)v]];
-    }
-    if (ivars) free(ivars);
-    WXN_ALOG(@"%@ 的状态字段：%@", tag, out.count ? [out componentsJoinedByString:@" "] : @"(没有)");
-}
-
 // 字段名对不上的时候，得能看到真实存在哪些名字
-static void WXNDumpIvars(Class c) {
-    if (!c) return;
-    NSMutableArray *out = [NSMutableArray array];
-    unsigned int n = 0;
-    Ivar *ivars = class_copyIvarList(c, &n);
-    for (unsigned int i = 0; i < n; i++) {
-        [out addObject:[NSString stringWithFormat:@"%s(%s)",
-                        ivar_getName(ivars[i]) ?: "?",
-                        ivar_getTypeEncoding(ivars[i]) ?: "?"]];
-    }
-    if (ivars) free(ivars);
-    WXN_ALOG(@"%@ 的字段(%u 个)：%@", NSStringFromClass(c), n,
-             [out componentsJoinedByString:@" "] ?: @"(空)");
-}
-
 static id WXNServiceCenter(void) {
     Class msc = NSClassFromString(@"MMServiceCenter");
     if (!msc) return nil;
@@ -1614,71 +1379,15 @@ static void WXNInstallCognitionHooks(void) {
     Class msc = NSClassFromString(@"MMServiceCenter");
     if (msc) WXNSwizzle(msc, @"getService:", (IMP)WXNGetServiceHook, &gOrigGetService);
 
-    Class ln = NSClassFromString(@"MMLocalNotificationMgr");
-    if (ln) WXNDumpIvars(ln);
-    if (app) WXNDumpIvars(app);
-
     // 微信的版本号很关键：字段名对不上时得知道是哪个版本
     WXN_ALOG(@"微信版本=%@", [[NSBundle mainBundle] infoDictionary][@"CFBundleShortVersionString"] ?: @"(取不到)");
 }
 
 // 取实例 / 读状态：只能在 App 真的起来之后调，构造器里会太早
-static void WXNDumpCognition(void) {
-    WXNTryGrabLN(@"诊断");
-    if (gLN) {
-        WXNDumpState(gLN, @"MMLocalNotificationMgr");
-        WXN_ALOG(@"微信自己的认知：后台=%d（1=它认为自己在后台）", (int)WXNReadLNBG());
-    }
-    Class app = NSClassFromString(@"MicroMessengerAppDelegate");
-    if (app && [app respondsToSelector:NSSelectorFromString(@"GlobalInstance")]) {
-        id inst = ((id (*)(id, SEL))objc_msgSend)((id)app, NSSelectorFromString(@"GlobalInstance"));
-        if (inst) {
-            WXNDumpState(inst, @"MicroMessengerAppDelegate");
-            SEL fg = NSSelectorFromString(@"isForeground");
-            if ([inst respondsToSelector:fg]) {
-                BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)(inst, fg);
-                WXN_ALOG(@"-isForeground 回答：%d", (int)v);
-            }
-        }
-    }
-    Class mon = NSClassFromString(@"AppMonitorImpl");
-    if (mon) WXN_ALOG(@"AppMonitorImpl %@", mon ? @"在" : @"不在");
-}
-
 static void WXNLNInit(id self, SEL _cmd) {
     WXNGrabLN(self);
     WXN_ALOG(@"微信服务启动：MMLocalNotificationMgr（当前认知 后台=%d）", (int)WXNReadLNBG());
     if (gOrigLNInit) gOrigLNInit(self, _cmd);
-}
-
-static void WXNLNEnterBG(id self, SEL _cmd) {
-    WXNGrabLN(self);
-    WXN_ALOG(@"微信收到“进后台”：m_isInBackground %d -> 1", (int)WXNReadLNBG());
-    if (gOrigLNEnterBG) gOrigLNEnterBG(self, _cmd);
-    WXN_ALOG(@"  回来一看 m_isInBackground = %d", (int)WXNReadLNBG());
-}
-
-static void WXNLNEnterFG(id self, SEL _cmd) {
-    WXNGrabLN(self);
-    WXN_ALOG(@"微信收到“回前台”：m_isInBackground %d -> 0", (int)WXNReadLNBG());
-    if (gOrigLNEnterFG) gOrigLNEnterFG(self, _cmd);
-    WXN_ALOG(@"  回来一看 m_isInBackground = %d", (int)WXNReadLNBG());
-}
-
-static void WXNLNShowPush(id self, SEL _cmd, id arg1, BOOL always) {
-    WXNGrabLN(self);
-    if (gFakeBG) WXNCognitionForce(YES);   // 已经走到这一步了，把认知坐实
-    WXN_ALOG(@"微信在考虑发推送：OnShowPush always=%d 认知后台=%d 内容=%@",
-             (int)always, (int)WXNReadLNBG(), WXNTrim([arg1 description] ?: @"", 120));
-    if (gOrigLNShowPush) gOrigLNShowPush(self, _cmd, arg1, always);
-}
-
-static void WXNLNShowPush2(id self, SEL _cmd, id wrap, id fireDate, BOOL voip) {
-    WXNGrabLN(self);
-    if (gFakeBG) WXNCognitionForce(YES);
-    WXN_ALOG(@"微信要发本地推送（短参数）voip=%d 认知后台=%d wrap=%@",
-             (int)voip, (int)WXNReadLNBG(), WXNTrim([wrap description] ?: @"", 120));
-    if (gOrigLNShowPush2) gOrigLNShowPush2(self, _cmd, wrap, fireDate, voip);
 }
 
 static void WXNLNShowPush3(id self, SEL _cmd, id wrap, id ident, id fireDate,
@@ -1696,18 +1405,13 @@ static void WXNInstallLocalNotificationProbe(void) {
         WXN_ALOG(@"本地通知探针：没有 MMLocalNotificationMgr 这个类");
         return;
     }
+    // 只留两个真正有用的：onServiceInit 是抓实例最早的时机，
+    // ShowPush 那一条里有一句"坐实认知"，其余全是日志，删掉。
     BOOL a = WXNSwizzle(c, @"onServiceInit", (IMP)WXNLNInit, &gOrigLNInit);
-    BOOL b = WXNSwizzle(c, @"onServiceEnterBackground", (IMP)WXNLNEnterBG, &gOrigLNEnterBG);
-    BOOL d = WXNSwizzle(c, @"onServiceEnterForeground", (IMP)WXNLNEnterFG, &gOrigLNEnterFG);
-    BOOL e = WXNSwizzle(c, @"OnShowPush:isAlwaysShow:", (IMP)WXNLNShowPush, &gOrigLNShowPush);
-    BOOL f = WXNSwizzle(c, @"showPushWithMessageWrap:fireDate:isFromVoipPush:",
-                        (IMP)WXNLNShowPush2, &gOrigLNShowPush2);
     BOOL g = WXNSwizzle(c,
         @"showPushWithMessageWrap:identifier:fireDate:isFromVoipPush:shouldSilent:",
         (IMP)WXNLNShowPush3, &gOrigLNShowPush3);
-    WXN_ALOG(@"本地通知探针：init=%@ 进后台=%@ 回前台=%@ OnShowPush=%@ 发push=%@/%@",
-             a ? @"已挂" : @"没挂", b ? @"已挂" : @"没挂", d ? @"已挂" : @"没挂",
-             e ? @"已挂" : @"没挂", f ? @"已挂" : @"没挂", g ? @"已挂" : @"没挂");
+    WXN_ALOG(@"本地通知钩子：init=%@ 发push=%@", a ? @"已挂" : @"没挂", g ? @"已挂" : @"没挂");
 }
 
 static void WXNEndFakeBackground(NSString *why) {
@@ -1743,7 +1447,6 @@ static void WXNBeginFakeBackground(NSString *why) {
     WXN_ALOG(@"认知实验：%@（LN=%@ 改前 后台=%d）", why, gLN ? @"拿到" : @"没拿到",
              (int)WXNReadLNBG());
     WXNCognitionForce(YES);
-    if (gLNIsBG) WXNDumpState(gLN, @"翻之后 MMLocalNotificationMgr");
 
     gFakeBG = YES;
     gFakeUntil = CFAbsoluteTimeGetCurrent() + 6.0;   // willPresent 可能晚到，窗口单独放宽
@@ -1984,110 +1687,8 @@ static void WXNSetupWithRetry(int attempt) {
 //   notifyutil -p cn.qwq.wxnotify.test
 // ---------------------------------------------------------------------------
 
-static void WXNPostTest(void) {
-    WXNPost([@"wxn-test-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
-            @"微信后台通知", nil, @"如果你看到这条横幅，说明两半都通了。",
-            @"wxn-test", nil, NO);
-}
-
 // 诊断：notifyutil -p cn.qwq.wxnotify.diag
 // 把环境、钩子、权限、Immortalizer 开关全写进日志文件
-static void WXNDumpReport(void) {
-    WXN_ALOG(@"======== 诊断开始 ========");
-    WXN_ALOG(@"pid=%d bundle=%@ version=%s", (int)getpid(),
-             [[NSBundle mainBundle] bundleIdentifier], WXN_VERSION);
-    WXN_ALOG(@"日志文件=%@", WXNLogPath() ?: @"(没有可写目录)");
-
-    UIApplication *app = [UIApplication sharedApplication];
-    WXN_ALOG(@"applicationState=%ld（0=Active 1=Inactive 2=Background）", (long)app.applicationState);
-    WXN_ALOG(@"最前台应用=%@", WXNCurrentFrontmostBundle() ?: @"(取不到)");
-    WXN_ALOG(@"场景信号：known=%d away=%d reasons=0x%llx（0=能看到 1=被 Immortalizer 全抹了）",
-             (int)gSceneKnown, (int)gSceneAway, (unsigned long long)gLastDeactReasons);
-    WXN_ALOG(@"锁屏=%d", WXNDeviceLocked());
-    NSString *frontWhy = nil;
-    BOOL inWx = WXNInWeChat(&frontWhy);
-    WXN_ALOG(@"前台状态文件：%@ -> %@", frontWhy ?: @"(空)", inWx ? @"人在微信里" : @"人不在微信里");
-    WXN_ALOG(@"backgroundTimeRemaining=%.0f protectedData=%d",
-             app.backgroundTimeRemaining, (int)app.protectedDataAvailable);
-    @try {
-        Class av = NSClassFromString(@"AVAudioSession");
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-        if (av && [av respondsToSelector:sh]) {
-            id sess = ((id (*)(id, SEL))objc_msgSend)(av, sh);
-            SEL vol = NSSelectorFromString(@"outputVolume");
-            if ([sess respondsToSelector:vol]) {
-                float v = ((float (*)(id, SEL))objc_msgSend)(sess, vol);
-                WXN_ALOG(@"输出音量=%.2f", v);
-            }
-        }
-    } @catch (__unused NSException *e) {}
-    WXN_ALOG(@"scene 列表=%@", WXNSceneInfo());
-    WXN_ALOG(@"CMessageMgr=%@ CMessageWrap=%@ CContactMgr=%@",
-             NSClassFromString(@"CMessageMgr") ? @"在" : @"不在",
-             NSClassFromString(@"CMessageWrap") ? @"在" : @"不在",
-             NSClassFromString(@"CContactMgr") ? @"在" : @"不在");
-    WXNDumpCognition();
-    WXN_ALOG(@"消息钩子(%lu 个)：%@", (unsigned long)gHookNames.count,
-             [gHookNames componentsJoinedByString:@" / "] ?: @"(一个也没挂上)");
-    WXN_ALOG(@"呈现钩子：willPresent=%@ 截获投递=%@ 当前 delegate=%@",
-             gOrigWillPresent ? @"已挂" : @"未挂",
-             gOrigAddRequest ? @"已挂" : @"未挂",
-             NSStringFromClass(object_getClass(
-                 [UNUserNotificationCenter currentNotificationCenter].delegate)) ?: @"(没有代理)");
-
-    // 列出 CMessageMgr 里所有跟消息到达有关的方法，版本对不上时好改钩子
-    Class cls = NSClassFromString(@"CMessageMgr");
-    if (cls) {
-        unsigned int n = 0;
-        Method *ms = class_copyMethodList(cls, &n);
-        for (unsigned int i = 0; i < n; i++) {
-            const char *nm = sel_getName(method_getName(ms[i]));
-            if (strstr(nm, "AddMsg") || strstr(nm, "NewMsg") || strstr(nm, "Notify"))
-                WXN_ALOG(@"  sel %s", nm);
-        }
-        free(ms);
-    }
-
-    // 通知权限
-    [[UNUserNotificationCenter currentNotificationCenter]
-        getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *s) {
-            WXN_ALOG(@"通知权限：authorization=%ld alertStyle=%ld sound=%ld badge=%ld",
-                     (long)s.authorizationStatus, (long)s.alertStyle,
-                     (long)s.soundSetting, (long)s.badgeSetting);
-        }];
-
-    // Immortalizer 的「前台通知」开关（沙盒里多半读不到，读到就直接说明问题）
-    @try {
-        NSUserDefaults *ip = [[NSUserDefaults alloc] initWithSuiteName:@"com.sergy.immortalizer.prefs"];
-        NSArray *sel = [ip objectForKey:@"selectedApplications"];
-        // 头像的本地路径藏在 CContact 的某个字段里，先把名字记下来
-    Class cc = NSClassFromString(@"CContact");
-    if (cc) {
-        NSMutableArray *hits = [NSMutableArray array];
-        unsigned int cnt = 0;
-        Ivar *ivars = class_copyIvarList(cc, &cnt);
-        for (unsigned int i = 0; i < cnt; i++) {
-            const char *n = ivar_getName(ivars[i]);
-            if (!n) continue;
-            NSString *name = @(n);
-            if ([name rangeOfString:@"ead" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                [name rangeOfString:@"mg" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                [hits addObject:name];
-            }
-        }
-        if (ivars) free(ivars);
-        WXN_ALOG(@"CContact 头像相关字段：%@",
-                 hits.count ? [hits componentsJoinedByString:@" / "] : @"(没找到)");
-    }
-
-    WXN_ALOG(@"Immortalizer selectedApplications=%@，含微信=%@", sel,
-                 [sel containsObject:@WXN_BUNDLE_ID] ? @"是" : @"否");
-    } @catch (__unused NSException *e) {
-        WXN_ALOG(@"读 Immortalizer 配置失败");
-    }
-    WXN_ALOG(@"======== 诊断结束 ========");
-}
-
 static void WXNPostBootOnce(void) {
     NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     if (!docs.count) return;
@@ -2125,37 +1726,6 @@ static void WXNPostBootOnce(void) {
 // 注意：只有“离开”类广播才算证据（known=1），回来类广播满天飞（启动时就一堆），
 // 不能拿它证明什么，否则 known 一上来就是 1，人永远被当成在微信里。
 static NSMutableArray *gNoticeTokens = nil;
-
-static void WXNInstallAppNotices(void) {
-    if (!gNoticeTokens) gNoticeTokens = [NSMutableArray array];
-    NSArray *names = @[@"UIApplicationDidEnterBackgroundNotification",
-                       @"UIApplicationWillEnterForegroundNotification",
-                       @"UIApplicationWillResignActiveNotification",
-                       @"UIApplicationDidBecomeActiveNotification",
-                       @"UISceneDidEnterBackgroundNotification",
-                       @"UISceneWillEnterForegroundNotification",
-                       @"UISceneWillDeactivateNotification",
-                       @"UISceneDidActivateNotification"];
-    for (NSString *n in names) {
-        id token = [[NSNotificationCenter defaultCenter]
-            addObserverForName:n
-                        object:nil
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification *note) {
-                        BOOL away = [n containsString:@"EnterBackground"] ||
-                                    [n containsString:@"WillDeactivate"] ||
-                                    [n containsString:@"WillResignActive"];
-                        WXN_ALOG(@"应用通知：%@（判为人已离开=%d）", n, (int)away);
-                        if (away) {
-                            gSceneKnown = YES;
-                            gSceneAway = YES;
-                            gLastDeactReasons = 0xFFFFFFFFull;
-                        }
-                    }];
-        if (token) [gNoticeTokens addObject:token];
-    }
-    WXN_ALOG(@"应用通知探针：已监听 %lu 个广播", (unsigned long)gNoticeTokens.count);
-}
 
 // ---------------------------------------------------------------------------
 // SpringBoard 侧守卫（2.14）
@@ -2363,23 +1933,6 @@ static void WXNFrontStart(void) {
 }
 
 // 心跳：每 30 秒一行，看清「前台状态文件说的是谁」。
-static void WXNHeartbeat(double expected) {
-    double now = CFAbsoluteTimeGetCurrent();
-    if (expected > 0 && now - expected > 8.0) {
-        WXN_ALOG(@"心跳迟到 %.0f 秒：这段时间进程被卡住过", now - expected);
-    }
-    NSString *why = nil;
-    BOOL in = WXNInWeChatSafe(&why);
-    WXN_ALOG(@"心跳 %@ -> %@ 微信认知后台=%d", why ?: @"(前台状态读不到)",
-             in ? @"人在微信里" : @"人不在微信里", (int)WXNReadLNBG());
-
-    double next = CFAbsoluteTimeGetCurrent() + 30.0;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                       WXNHeartbeat(next);
-                   });
-}
-
 __attribute__((constructor))
 static void WXNInit(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
@@ -2395,66 +1948,34 @@ static void WXNInit(void) {
     if (![bid isEqualToString:@WXN_BUNDLE_ID]) return;
 
     gWxnStartAt = CFAbsoluteTimeGetCurrent();
+    WXNLoadConfig();      // 先读配置：日志开关在这一步之后才生效
     WXN_ALOG(@"======== WxNotify %s 已加载 pid=%d ========", WXN_VERSION, (int)getpid());
-    WXNLoadConfig();
 
     static int changedToken = -1;
     notify_register_dispatch(WXN_CHANGED_NOT, &changedToken, dispatch_get_main_queue(), ^(int t) {
         WXNLoadConfig();
     });
 
-    static int testToken = -1;
-    notify_register_dispatch(WXN_TEST_NOT, &testToken, dispatch_get_main_queue(), ^(int t) {
-        WXNLoadConfig();
-        WXN_ALOG(@"收到测试通知请求");
-        WXNPostTest();
-    });
-
-    static int diagToken = -1;
-    notify_register_dispatch(WXN_DIAG_NOT, &diagToken, dispatch_get_main_queue(), ^(int t) {
-        WXNDumpReport();
-    });
-
-    WXNInstallSceneProbe();
-    WXNInstallAppNotices();
     WXNInstallLocalNotificationProbe();
     WXNInstallCognitionHooks();
     WXNInstallBadge();
     WXNWatchFront();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
-    WXN_ALOG(@"初始化完成（构造器结束），心跳 10 秒后开始");
 
-    // 启动看门狗：万一哪一步卡死，日志里能看到到底停在哪里
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                       WXN_ALOG(@"启动 2 秒：主线程还能跑");
-                   });
-
-    // 用户那边跑不了命令，所以启动后自己写一份诊断到沙盒，并弹一条自检
+    // 8 秒补挂一次：有的版本类注册得晚，或者被别的插件盖回去了。
+    // 自检通知只在这里、且只在 debug 打开时弹，日常版本一条都不弹。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       WXNInstallSceneProbe();   // 被别人又盖回去的，重新接管一次
                        WXNInstallCognitionHooks();
-                       WXNDumpCognition();
                        WXNSetupPresentationHooks();
-                       WXNDumpReport();
-                       WXNPostBootOnce();
-                   });
-    // 有些机器上 CMessageMgr 注册得很晚，20 秒再补一次
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                       WXNInstallSceneProbe();
-                       WXNTryGrabLN(@"启动 20 秒");
-                       WXNDumpCognition();
-                       WXNSetupPresentationHooks();
-                       WXNDumpReport();
+                       if (WXNDebug()) WXNPostBootOnce();
                    });
 
-    // 心跳：切到别的 App 时微信自己一条日志都不写，看上去就像“日志停在某分钟”。
-    // 每 30 秒写一行，至少能证明进程还活着、场景信号有没有在动。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+    // 20 秒再补一次，顺便把可能还没起来的 MMLocalNotificationMgr 抓到手
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       WXNHeartbeat(0);
+                       WXNTryGrabLN(@"启动 20 秒");
+                       WXNSetupPresentationHooks();
                    });
 }
