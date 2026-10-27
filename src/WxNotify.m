@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.8"
+#define WXN_VERSION     "2.9"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -1018,6 +1018,10 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
+    // 人不在微信里：先拿走微信自己的“我在前台”认知，让它自己发
+    // （它整条原生链路一并跑：群名、免打扰、角标、声音都是它自己的）
+    WXNBeginFakeBackground(@"消息到达");
+
     // 自己发出去的消息不提醒
     Class wrapCls = NSClassFromString(@"CMessageWrap");
     if (wrapCls && [(id)wrapCls respondsToSelector:@selector(isSenderFromMsgWrap:)]) {
@@ -1363,33 +1367,157 @@ static void WXNInstallFakeBG(void) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// 让微信自己发：改它自己的认知
+//
+// 8.0.5x 头文件里查到了：微信判“要不要发本地通知”看的是
+// MMLocalNotificationMgr 自己的 ivar m_isInBackground，
+// 而它只在 onServiceEnterBackground / onServiceEnterForeground 里被改。
+// 这两个回调跟着生命周期一起被 Immortalizer 抹掉了，所以它永远是 0，
+// 微信就永远认为“我在前台，不用发”。
+// 我们在消息到达的那一刻把它改成 1，让微信自己的整条通知链路跑起来。
+// ---------------------------------------------------------------------------
+
+static id gLN = nil;
+static Ivar gLNIsBG = NULL;
+static void (*gOrigLNInit)(id, SEL);
+static void (*gOrigLNEnterBG)(id, SEL);
+static void (*gOrigLNEnterFG)(id, SEL);
+static void (*gOrigLNShowPush)(id, SEL, id, BOOL);
+static void (*gOrigLNShowPush2)(id, SEL, id, id, BOOL);
+static void (*gOrigLNShowPush3)(id, SEL, id, id, id, BOOL, BOOL);
+
+static void WXNGrabLN(id self) {
+    if (gLN != self) {
+        gLN = self;
+        WXN_ALOG(@"拿到 MMLocalNotificationMgr：%@", self);
+    }
+    if (!gLNIsBG) {
+        gLNIsBG = class_getInstanceVariable(object_getClass(self), "m_isInBackground");
+        if (!gLNIsBG) gLNIsBG = class_getInstanceVariable(object_getClass(self), "_m_isInBackground");
+        WXN_ALOG(@"m_isInBackground 字段：%@", gLNIsBG ? @"找到" : @"没找到");
+    }
+}
+
+static BOOL WXNReadLNBG(void) {
+    if (!gLN || !gLNIsBG) return NO;
+    BOOL *p = (BOOL *)((char *)(__bridge void *)gLN + ivar_getOffset(gLNIsBG));
+    return *p ? YES : NO;
+}
+
+static void WXNCognitionForce(BOOL bg) {
+    if (!gLN || !gLNIsBG) return;
+    BOOL *p = (BOOL *)((char *)(__bridge void *)gLN + ivar_getOffset(gLNIsBG));
+    if ((*p ? YES : NO) == bg) return;
+    *p = bg;
+    WXN_ALOG(@"微信的认知：m_isInBackground = %d", (int)bg);
+}
+
+static void WXNCognitionRestore(void) {
+    WXNCognitionForce(NO);
+}
+
+static void WXNLNInit(id self, SEL _cmd) {
+    WXNGrabLN(self);
+    WXN_ALOG(@"微信服务启动：MMLocalNotificationMgr（当前认知 后台=%d）", (int)WXNReadLNBG());
+    if (gOrigLNInit) gOrigLNInit(self, _cmd);
+}
+
+static void WXNLNEnterBG(id self, SEL _cmd) {
+    WXNGrabLN(self);
+    WXN_ALOG(@"微信收到“进后台”：m_isInBackground %d -> 1", (int)WXNReadLNBG());
+    if (gOrigLNEnterBG) gOrigLNEnterBG(self, _cmd);
+    WXN_ALOG(@"  回来一看 m_isInBackground = %d", (int)WXNReadLNBG());
+}
+
+static void WXNLNEnterFG(id self, SEL _cmd) {
+    WXNGrabLN(self);
+    WXN_ALOG(@"微信收到“回前台”：m_isInBackground %d -> 0", (int)WXNReadLNBG());
+    if (gOrigLNEnterFG) gOrigLNEnterFG(self, _cmd);
+    WXN_ALOG(@"  回来一看 m_isInBackground = %d", (int)WXNReadLNBG());
+}
+
+static void WXNLNShowPush(id self, SEL _cmd, id arg1, BOOL always) {
+    WXNGrabLN(self);
+    WXN_ALOG(@"微信在考虑发推送：OnShowPush always=%d 认知后台=%d 内容=%@",
+             (int)always, (int)WXNReadLNBG(), WXNTrim([arg1 description] ?: @"", 120));
+    if (gOrigLNShowPush) gOrigLNShowPush(self, _cmd, arg1, always);
+}
+
+static void WXNLNShowPush2(id self, SEL _cmd, id wrap, id fireDate, BOOL voip) {
+    WXNGrabLN(self);
+    WXN_ALOG(@"微信要发本地推送（短参数）voip=%d 认知后台=%d wrap=%@",
+             (int)voip, (int)WXNReadLNBG(), WXNTrim([wrap description] ?: @"", 120));
+    if (gOrigLNShowPush2) gOrigLNShowPush2(self, _cmd, wrap, fireDate, voip);
+}
+
+static void WXNLNShowPush3(id self, SEL _cmd, id wrap, id ident, id fireDate,
+                           BOOL voip, BOOL silent) {
+    WXNGrabLN(self);
+    WXN_ALOG(@"微信要发本地推送（全参数）voip=%d silent=%d 认知后台=%d id=%@",
+             (int)voip, (int)silent, (int)WXNReadLNBG(), ident);
+    if (gOrigLNShowPush3) gOrigLNShowPush3(self, _cmd, wrap, ident, fireDate, voip, silent);
+}
+
+static void WXNInstallLocalNotificationProbe(void) {
+    Class c = NSClassFromString(@"MMLocalNotificationMgr");
+    if (!c) {
+        WXN_ALOG(@"本地通知探针：没有 MMLocalNotificationMgr 这个类");
+        return;
+    }
+    BOOL a = WXNSwizzle(c, @"onServiceInit", (IMP)WXNLNInit, &gOrigLNInit);
+    BOOL b = WXNSwizzle(c, @"onServiceEnterBackground", (IMP)WXNLNEnterBG, &gOrigLNEnterBG);
+    BOOL d = WXNSwizzle(c, @"onServiceEnterForeground", (IMP)WXNLNEnterFG, &gOrigLNEnterFG);
+    BOOL e = WXNSwizzle(c, @"OnShowPush:isAlwaysShow:", (IMP)WXNLNShowPush, &gOrigLNShowPush);
+    BOOL f = WXNSwizzle(c, @"showPushWithMessageWrap:fireDate:isFromVoipPush:",
+                        (IMP)WXNLNShowPush2, &gOrigLNShowPush2);
+    BOOL g = WXNSwizzle(c,
+        @"showPushWithMessageWrap:identifier:fireDate:isFromVoipPush:shouldSilent:",
+        (IMP)WXNLNShowPush3, &gOrigLNShowPush3);
+    WXN_ALOG(@"本地通知探针：init=%@ 进后台=%@ 回前台=%@ OnShowPush=%@ 发push=%@/%@",
+             a ? @"已挂" : @"没挂", b ? @"已挂" : @"没挂", d ? @"已挂" : @"没挂",
+             e ? @"已挂" : @"没挂", f ? @"已挂" : @"没挂", g ? @"已挂" : @"没挂");
+}
+
 static void WXNEndFakeBackground(NSString *why) {
     if (!gFakeBG) return;
     gFakeBG = NO;
-    WXN_ALOG(@"假装后台结束（%@）", why);
+    WXNCognitionRestore();
+    WXN_ALOG(@"认知实验结束（%@）", why);
 }
 
 // 在把消息交回微信之前调用：先骗它一会儿，看它会不会自己发通知
 static void WXNBeginFakeBackground(NSString *why) {
-    if (!WXNConfigCopy().nativeNotify) return;
     if (gFakeBG) return;
-    UIApplication *app = [UIApplication sharedApplication];
-    if (!app) return;
-    WXNInstallFakeBG();
 
-    NSInteger real = gOrigAppState ? gOrigAppState(app, @selector(applicationState))
-                                   : UIApplicationStateActive;
-    if (real == UIApplicationStateBackground) return;
-
-    gRealAppState = real;
     gNativePostsAtStart = gNativePosts;
+
+    if (WXNConfigCopy().nativeNotify) {
+        // 老方案（实测微信不看它，留着做对照）
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
+        WXNInstallFakeBG();
+        NSInteger real = gOrigAppState ? gOrigAppState(app, @selector(applicationState))
+                                       : UIApplicationStateActive;
+        if (real == UIApplicationStateBackground) return;
+        gRealAppState = real;
+        WXN_ALOG(@"假装后台：%@（真实 state=%ld）", why, (long)real);
+    } else {
+        // 新方案：直接改微信自己的那个标志
+        if (!gLN || !gLNIsBG) {
+            WXN_ALOG(@"认知实验：还没拿到 MMLocalNotificationMgr，本次不试");
+            return;
+        }
+        WXN_ALOG(@"认知实验：%@（改前 后台=%d）", why, (int)WXNReadLNBG());
+        WXNCognitionForce(YES);
+    }
+
     gFakeBG = YES;
     int gen = ++gFakeBGGen;
-    WXN_ALOG(@"假装后台：%@（真实 state=%ld）", why, (long)real);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        if (gen != gFakeBGGen || !gFakeBG) return;
-                       WXNEndFakeBackground(@"2 秒到点");
+                       WXNEndFakeBackground(@"2.5 秒到点");
                    });
 }
 
@@ -1828,12 +1956,12 @@ static void WXNHeartbeat(double expected) {
     }
 
     BOOL frameAlive = WXNFrameAlive();
-    WXN_ALOG(@"心跳 画面=%@（%.0f秒前刷过，共%ld帧） 触摸=%.0f秒 冻结=%.0f秒内 %.0f秒 场景 known=%d away=%d",
+    WXN_ALOG(@"心跳 画面=%@（%.0f秒前刷过，共%ld帧） 触摸=%.0f秒 冻结=%.0f秒内 %.0f秒 微信认知后台=%d",
              frameAlive ? @"在刷" : @"停了",
              gFrameTicks > 0 ? now - gLastFrameAt : -1, gFrameTicks,
              gLastTouch > 0 ? now - gLastTouch : -1,
              gLastFreezeAt > 0 ? now - gLastFreezeAt : -1, gLastFreezeLen,
-             (int)gSceneKnown, (int)gSceneAway);
+             (int)WXNReadLNBG());
 
     double next = CFAbsoluteTimeGetCurrent() + 30.0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
@@ -1871,6 +1999,7 @@ static void WXNInit(void) {
 
     WXNInstallSceneProbe();
     WXNInstallAppNotices();
+    WXNInstallLocalNotificationProbe();
     WXNInstallTouch();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
