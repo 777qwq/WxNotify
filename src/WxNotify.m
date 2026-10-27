@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.15"
+#define WXN_VERSION     "2.16"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -532,6 +532,24 @@ static BOOL WXNInWeChat(NSString **whyOut) {
     return [f[0] isEqualToString:@WXN_BUNDLE_ID];
 }
 
+static BOOL WXNInWeChat(NSString **whyOut);
+
+// 进程起来的时间。启动那十来秒 SpringBoard 还没把微信算成最前台，
+// 状态文件会是 (nil)，那时候的“人走了”不能信，否则刚开微信就弹一条。
+static double gWxnStartAt = 0;
+
+static BOOL WXNInWeChatSafe(NSString **whyOut) {
+    NSString *why = nil;
+    BOOL in = WXNInWeChat(&why);
+    if (!in && !WXNDeviceLocked() && gWxnStartAt > 0 &&
+        CFAbsoluteTimeGetCurrent() - gWxnStartAt < 12.0) {
+        why = [why stringByAppendingString:@"（刚启动，当还在微信里）"];
+        in = YES;
+    }
+    if (whyOut) *whyOut = why;
+    return in;
+}
+
 static BOOL WXNShouldNotify(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return NO;
@@ -547,7 +565,7 @@ static BOOL WXNShouldNotify(void) {
     }
 
     NSString *why = nil;
-    BOOL inWeChat = WXNInWeChat(&why);
+    BOOL inWeChat = WXNInWeChatSafe(&why);
     WXN_ALOG(@"  前台判断：%@ -> %@", why ?: @"(无)", inWeChat ? @"人在微信里" : @"人不在微信里");
     return !inWeChat;
 }
@@ -1268,7 +1286,7 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
     double now = CFAbsoluteTimeGetCurrent();
     BOOL faked = (now < gFakeUntil);
     NSString *why = nil;
-    BOOL inWeChat = !gForceNextBanner && !faked && WXNInWeChat(&why);
+    BOOL inWeChat = !gForceNextBanner && !faked && WXNInWeChatSafe(&why);
 
     // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
     // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
@@ -1907,6 +1925,8 @@ static void WXNProbeOnLeave(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         WXN_ALOG(@"探针：人已离开微信，投一条测试通知，看横幅画不画得出来");
+        // 走和真实消息一样的路（翻认知 → 投递），所以它会响，不会静悄悄飘过去
+        WXNBeginFakeBackground(@"前台探针");
         WXNPost([@"wxn-probe-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
                 @"前台探针", nil,
                 @"看到这条横幅，说明离开微信后能弹了。",
@@ -1917,7 +1937,7 @@ static void WXNProbeOnLeave(void) {
 static void WXNWatchFront(void) {
     @try {
         NSString *why = nil;
-        BOOL in = WXNInWeChat(&why);
+        BOOL in = WXNInWeChatSafe(&why);
         if (in != gWasInWeChat) {
             gWasInWeChat = in;
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
@@ -2349,7 +2369,7 @@ static void WXNHeartbeat(double expected) {
         WXN_ALOG(@"心跳迟到 %.0f 秒：这段时间进程被卡住过", now - expected);
     }
     NSString *why = nil;
-    BOOL in = WXNInWeChat(&why);
+    BOOL in = WXNInWeChatSafe(&why);
     WXN_ALOG(@"心跳 %@ -> %@ 微信认知后台=%d", why ?: @"(前台状态读不到)",
              in ? @"人在微信里" : @"人不在微信里", (int)WXNReadLNBG());
 
@@ -2374,6 +2394,7 @@ static void WXNInit(void) {
     // 硬保险：不是微信就什么都不做
     if (![bid isEqualToString:@WXN_BUNDLE_ID]) return;
 
+    gWxnStartAt = CFAbsoluteTimeGetCurrent();
     WXN_ALOG(@"======== WxNotify %s 已加载 pid=%d ========", WXN_VERSION, (int)getpid());
     WXNLoadConfig();
 
