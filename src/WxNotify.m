@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.18"
+#define WXN_VERSION     "2.19"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1168,6 +1168,22 @@ static BOOL WXNForcePresentation(void) {
     return !WXNInWeChatSafe(NULL);
 }
 
+// 2.19：同一条消息在几秒内被呈现两次时，iOS 会把前一条横幅收回去、
+// 再把后一条放出来——看上去就是“缩回去又弹出来”。第二次的来路可能是
+// 微信自己也补了一条、APNs 又下来一条，或者同一个请求被重复呈现；
+// 不去分辨来路，一律按「会话+标题+正文」在 3 秒内压掉。
+static NSString *gLastPresentFP = nil;
+static double gLastPresentAt = 0;
+
+static BOOL WXNDuplicatePresentation(NSString *fp) {
+    if (!fp.length) return NO;
+    double now = CFAbsoluteTimeGetCurrent();
+    BOOL dup = gLastPresentFP && [gLastPresentFP isEqualToString:fp] && now - gLastPresentAt < 3.0;
+    gLastPresentFP = fp;
+    gLastPresentAt = now;
+    return dup;
+}
+
 static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
                            void (^completion)(NSUInteger)) {
     double now = CFAbsoluteTimeGetCurrent();
@@ -1185,6 +1201,21 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
     if (inWeChat) {
         WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
         WXNBadgeRollback(@"前台静默");
+        if (completion) completion(UNNotificationPresentationOptionNone);
+        return;
+    }
+
+    // 同一条消息的第二份（不管是谁发的）不再呈现，否则横幅会先收回再弹出
+    NSString *fp = nil;
+    @try {
+        id content = [[notification valueForKey:@"request"] valueForKey:@"content"];
+        fp = [NSString stringWithFormat:@"%@|%@|%@",
+              [content valueForKey:@"threadIdentifier"] ?: @"",
+              [content valueForKey:@"title"] ?: @"",
+              [content valueForKey:@"body"] ?: @""];
+    } @catch (__unused NSException *e) { fp = nil; }
+    if (WXNDuplicatePresentation(fp)) {
+        WXN_ALOG(@"前台呈现 -> 3 秒内同一条消息重复呈现，压掉后一条（%@）", WXNTrim(fp, 60));
         if (completion) completion(UNNotificationPresentationOptionNone);
         return;
     }
