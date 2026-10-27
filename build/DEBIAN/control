@@ -1,6 +1,6 @@
 Package: cn.qwq.wxnotify
 Name: 微信后台通知补发
-Version: 1.3
+Version: 1.4
 Architecture: iphoneos-arm64
 Description: 给被 Immortalizer 保活的微信补回后台横幅通知。
  Immortalizer 让微信一直以为自己在前台，微信因此不会自己发本地通知。

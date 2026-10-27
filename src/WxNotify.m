@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "1.3"
+#define WXN_VERSION     "1.4"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -418,6 +418,16 @@ static BOOL WXNSeenBefore(NSString *key) {
 // ---------------------------------------------------------------------------
 
 static void WXNSetupPresentationHooks(void);
+static void WXNDumpDelivered(NSString *tag);
+
+// 微信的富消息（表情/图片/链接）正文是 XML，直接当通知正文会很难看
+static NSString *WXNCleanBody(NSString *s, unsigned int type) {
+    if (!s.length) return WXNPlaceholder(type);
+    NSString *t = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([t hasPrefix:@"<"] || [t rangeOfString:@"<msg>"].location != NSNotFound)
+        return WXNPlaceholder(type);
+    return t;
+}
 
 // 微信自己的未读总数，用来给通知带角标。取不到就不动，免得把角标误清零。
 static NSNumber *WXNUnreadCount(void) {
@@ -457,6 +467,8 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *body, NSStr
     UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
     content.title = title.length ? title : @"微信";
     content.body = body.length ? body : @"新消息";
+    // 临时标记：方便分清屏上两条横幅哪条是本插件发的
+    content.subtitle = @"WxNotify";
     if (c.sound) content.sound = [UNNotificationSound defaultSound];
     if (thread.length) content.threadIdentifier = thread;
     content.userInfo = @{ @"wxsession": thread ?: @"" };
@@ -476,7 +488,13 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *body, NSStr
         addNotificationRequest:req
              withCompletionHandler:^(NSError *error) {
                  if (error) WXN_ALOG(@"投递失败 %@: %@", identifier, error);
-                 else WXN_LOG(@"已投递 %@", identifier);
+                 else {
+                     WXN_LOG(@"已投递 %@", identifier);
+                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                                    dispatch_get_main_queue(), ^{
+                                        WXNDumpDelivered(identifier);
+                                    });
+                 }
              }];
 }
 
@@ -591,7 +609,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         body = @"你收到一条新消息";
     }
 
-    body = WXNTrim(body ?: @"新消息", WXN_BODY_MAX);
+    body = WXNTrim(WXNCleanBody(body, type) ?: @"新消息", WXN_BODY_MAX);
 
     WXNPost([@"wxn-" stringByAppendingString:key], title, body, session);
 }
@@ -650,6 +668,34 @@ static void WXNMsgHook2(id self, SEL _cmd, id a1, id a2) {
     @autoreleasepool {
         WXNHandleMessage(self, WXNPickWrap(a1, a2), name);
     }
+}
+
+// 微信在决定「要不要对外提醒」时会走这里，记一下就知道它到底想不想发通知
+static IMP gOrigNotifyToExt;
+
+static void WXNNotifyToExt(id self, SEL _cmd, id a1) {
+    if (WXNSaneObj(a1)) {
+        @try {
+            WXN_ALOG(@"[MainThreadNotifyToExt] 微信要对外提醒 arg=%@ (%@)", a1,
+                     NSStringFromClass(object_getClass(a1)));
+        } @catch (__unused NSException *e) {
+            WXN_ALOG(@"[MainThreadNotifyToExt] 命中，但入参打印失败");
+        }
+    } else {
+        WXN_ALOG(@"[MainThreadNotifyToExt] 命中，入参不是对象(%p)", a1);
+    }
+    if (gOrigNotifyToExt) ((void (*)(id, SEL, id))gOrigNotifyToExt)(self, _cmd, a1);
+}
+
+// 投递后把系统里当前存在的通知 id 抄一份，用来分清屏上的第二张横幅是谁的
+static void WXNDumpDelivered(NSString *tag) {
+    [[UNUserNotificationCenter currentNotificationCenter]
+        getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> *list) {
+            NSMutableArray<NSString *> *ids = [NSMutableArray array];
+            for (UNNotification *n in list) [ids addObject:n.request.identifier];
+            WXN_ALOG(@"[已送达] %@ 之后2秒，系统里共 %lu 条：%@", tag, (unsigned long)ids.count,
+                     [ids componentsJoinedByString:@" | "] ?: @"(空)");
+        }];
 }
 
 static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
@@ -832,6 +878,14 @@ static BOOL WXNInstall(void) {
             WXN_ALOG(@"没有 %@，跳过", name);
             continue;
         }
+        // 入参不是两个对象的就不碰，否则会把非对象入参当 id 用
+        NSMethodSignature *sig = [cls instanceMethodSignatureForSelector:NSSelectorFromString(name)];
+        if (!sig || sig.numberOfArguments != 3 ||
+            strcmp([sig getArgumentTypeAtIndex:2], "@") != 0 ||
+            strcmp([sig getArgumentTypeAtIndex:3], "@") != 0) {
+            WXN_ALOG(@"%@ 的入参不是两个对象，跳过", name);
+            continue;
+        }
         IMP orig = method_getImplementation(m);
         if (orig != (IMP)WXNMsgHook2) {
             gOrigMap[name] = [NSValue valueWithPointer:orig];
@@ -845,6 +899,16 @@ static BOOL WXNInstall(void) {
     NSString *three = @"AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:";
     any |= WXNSwizzle(cls, three, (IMP)WXNForSessionNotify, &gOrigForSessionNotify);
     if (gOrigForSessionNotify && ![gHookNames containsObject:three]) [gHookNames addObject:three];
+
+    // 只记不改：微信到底有没有决定对外提醒
+    SEL extSel = NSSelectorFromString(@"MainThreadNotifyToExt:");
+    NSMethodSignature *extSig = [cls instanceMethodSignatureForSelector:extSel];
+    if (extSig && extSig.numberOfArguments == 3 &&
+        strcmp([extSig getArgumentTypeAtIndex:2], "@") == 0) {
+        any |= WXNSwizzle(cls, @"MainThreadNotifyToExt:", (IMP)WXNNotifyToExt, &gOrigNotifyToExt);
+    } else if (extSig) {
+        WXN_ALOG(@"MainThreadNotifyToExt: 入参不是对象，不挂");
+    }
     return any;
 }
 
