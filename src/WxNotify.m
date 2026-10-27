@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.6"
+#define WXN_VERSION     "2.7"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -1754,24 +1754,39 @@ static void WXNInstallAppNotices(void) {
 }
 @end
 
+// 注意：一定要等 App 真的起来了再建这个探针。
+// 2.6 把它放在构造器里（UIApplication 还不存在时就碰 UIScreen），
+// 结果微信卡在地球启动画面进不去。现在改成必须主线程 + App 已启动 + 只在 8 秒后调。
 static void WXNInstallFrameProbe(void) {
-    UIScreen *scr = [UIScreen mainScreen];
-    SEL sel = NSSelectorFromString(@"displayLinkWithTarget:selector:");
-    if (!scr || ![scr respondsToSelector:sel]) {
-        WXN_ALOG(@"帧探针：这台系统没有 displayLinkWithTarget:，改用触摸判断");
+    if (gFrameLink) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ WXNInstallFrameProbe(); });
         return;
     }
-    WXNFrameWatcher *w = [[WXNFrameWatcher alloc] init];
-    CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))objc_msgSend)(
-        scr, sel, w, @selector(tick:));
-    if (!link) {
-        WXN_ALOG(@"帧探针：displayLink 创建失败，改用触摸判断");
-        return;
+    @try {
+        Class dl = NSClassFromString(@"CADisplayLink");
+        SEL make = NSSelectorFromString(@"displayLinkWithTarget:selector:");
+        if (!dl || ![dl respondsToSelector:make]) {
+            WXN_ALOG(@"帧探针：系统没有 CADisplayLink，改用触摸判断");
+            return;
+        }
+        WXNFrameWatcher *w = [[WXNFrameWatcher alloc] init];
+        CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))objc_msgSend)(
+            dl, make, w, @selector(tick:));
+        if (!link) {
+            WXN_ALOG(@"帧探针：displayLink 创建失败，改用触摸判断");
+            return;
+        }
+        SEL psel = NSSelectorFromString(@"setPreferredFramesPerSecond:");
+        if ([link respondsToSelector:psel]) {
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(link, psel, 2);
+        }
+        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        gFrameLink = link;   // 强引用住，别被回收
+        WXN_ALOG(@"帧探针：已启动（2fps）");
+    } @catch (NSException *e) {
+        WXN_ALOG(@"帧探针：启动失败 %@，改用触摸判断", e);
     }
-    link.preferredFramesPerSecond = 2;
-    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-    gFrameLink = link;   // 强引用住，别被回收
-    WXN_ALOG(@"帧探针：已启动（2fps）");
 }
 
 // 冻结检测：realtime 一直在走，monotonic 在进程停摆时不走，两者差值就是停了多久
@@ -1839,15 +1854,22 @@ static void WXNInit(void) {
 
     WXNInstallSceneProbe();
     WXNInstallAppNotices();
-    WXNInstallFrameProbe();
     WXNInstallTouch();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
+    WXN_ALOG(@"初始化完成（构造器结束），心跳 10 秒后开始");
+
+    // 启动看门狗：万一哪一步卡死，日志里能看到到底停在哪里
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXN_ALOG(@"启动 2 秒：主线程还能跑");
+                   });
 
     // 用户那边跑不了命令，所以启动后自己写一份诊断到沙盒，并弹一条自检
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNInstallSceneProbe();   // 被别人又盖回去的，重新接管一次
+                       WXNInstallFrameProbe();   // 这时 App 已经起来了，建探针才安全
                        WXNSetupPresentationHooks();
                        WXNDumpReport();
                        WXNPostBootOnce();
