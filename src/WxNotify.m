@@ -582,7 +582,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         if (nick.length) body = [NSString stringWithFormat:@"%@: %@", nick, body];
     } else {
         title = WXNDisplayName(session);
-        if (!title.length) title = WXNDisplayName(fromUsr);
+        if (!title.length) title = WXNDisplayName(rawFrom);
         if (!title.length) title = @"微信";
     }
 
