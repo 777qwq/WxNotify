@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.3"
+#define WXN_VERSION     "2.4"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -951,7 +951,20 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    NSString *session = rawChat.length ? rawChat : rawFrom;
+    // 群消息的字段很容易搞反：m_nsFromUsr 是群 id（xxx@chatroom），
+    // m_nsRealChatUsr 反而是发消息那个人的 wxid。2.2 拿后者当会话，于是
+    // 群消息被当成了单聊、标题变成了对方的昵称。
+    NSString *session = nil;
+    BOOL isGroup = NO;
+    if ([rawFrom hasSuffix:@"@chatroom"]) {
+        session = rawFrom;
+        isGroup = YES;
+    } else if ([rawChat hasSuffix:@"@chatroom"]) {
+        session = rawChat;
+        isGroup = YES;
+    } else {
+        session = rawChat.length ? rawChat : rawFrom;
+    }
     if (!session.length) {
         WXN_ALOG(@"  跳过：from 和 chat 都取不到");
         return;
@@ -967,11 +980,19 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    BOOL isGroup = [session hasSuffix:@"@chatroom"];
-
     NSString *body = WXNBody(wrap, type);
     NSString *senderUsr = rawFrom;
-    if (isGroup) body = WXNSplitGroupSender(body, &senderUsr);
+    if (isGroup) {
+        // 正文开头的 "wxid_xxx:\n" 是发送者，有的版本会被微信自己剥掉，
+        // 那种情况发送者就在 m_nsRealChatUsr 里
+        NSString *fromBody = nil;
+        body = WXNSplitGroupSender(body, &fromBody);
+        senderUsr = fromBody;
+        if (!senderUsr.length || [senderUsr isEqualToString:session] ||
+            [senderUsr hasSuffix:@"@chatroom"]) {
+            senderUsr = rawChat.length ? rawChat : session;
+        }
+    }
 
     // 群聊：主标题群名、副标题昵称；单聊：主标题就是对方
     NSString *title = WXNDisplayName(session);
@@ -1133,11 +1154,12 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
         return;
     }
 
+    // 这里千万不要带 Sound：系统在调 willPresent 就说明微信自己还活着，
+    // 它自己的提示音已经响过一遍了，再响一次就是双提示音。
     NSUInteger opts = UNNotificationPresentationOptionBanner |
                       UNNotificationPresentationOptionList |
-                      UNNotificationPresentationOptionSound |
                       UNNotificationPresentationOptionBadge;
-    WXN_ALOG(@"前台呈现 -> 强制横幅+声音+角标");
+    WXN_ALOG(@"前台呈现 -> 强制横幅+角标（声音交给微信自己那一声）");
     if (completion) completion(opts);
 }
 
