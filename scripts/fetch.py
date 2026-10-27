@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -26,21 +27,39 @@ def api(path):
         return json.loads(resp.read() or b'{}')
 
 
-def latest_run():
+SHA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.last_sha')
+
+
+def want_sha():
+    """要等的是哪一次提交：命令行 --sha 优先，其次 push.py 落下的 .last_sha。"""
+    if '--sha' in sys.argv:
+        return sys.argv[sys.argv.index('--sha') + 1]
+    if os.path.exists(SHA_FILE):
+        return open(SHA_FILE).read().strip() or None
+    return None
+
+
+def latest_run(sha=None):
     runs = api(f'/repos/{OWNER}/{REPO}/actions/workflows/build.yml/runs?per_page=10')['workflow_runs']
+    if sha:
+        # 只认这次提交对应的 run。以前按 id 取最新，push 完 run 还没建出来时
+        # 会拿到上一次的旧产物（2.12 就这么被打成了 2.11）
+        runs = [r for r in runs if r['head_sha'] == sha]
     runs.sort(key=lambda r: r['id'], reverse=True)
     return runs[0] if runs else None
 
 
-def wait_run(timeout=1200):
+def wait_run(timeout=1200, sha=None):
     t0 = time.time()
     while time.time() - t0 < timeout:
-        r = latest_run()
+        r = latest_run(sha)
         if r:
-            print('run', r['id'], r['status'], r.get('conclusion'),
+            print('run', r['id'], r['head_sha'][:8], r['status'], r.get('conclusion'),
                   r['head_commit']['message'][:40], flush=True)
             if r['status'] == 'completed':
                 return r
+        else:
+            print('等这次提交的 run 出现…', flush=True)
         time.sleep(10)
     raise SystemExit('timeout waiting for run')
 
@@ -86,7 +105,7 @@ def download(run_id):
 
 
 if __name__ == '__main__':
-    r = wait_run()
+    r = wait_run(sha=want_sha())
     print('conclusion:', r.get('conclusion'))
     if r.get('conclusion') != 'success':
         raise SystemExit('build failed: %s' % r.get('conclusion'))

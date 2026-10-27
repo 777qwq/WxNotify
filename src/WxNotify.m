@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.12"
+#define WXN_VERSION     "2.13"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -488,11 +488,26 @@ static BOOL WXNDeviceLocked(void) {
 // 它不受沙盒限制，也骗不到（Immortalizer 骗的是 App 自己），
 // 同一个 dylib 注入 com.apple.springboard 后每半秒把真实的 frontmost 写进这个文件：
 //     bundle|时间戳|锁屏|熄屏|用的哪个接口
+//
+// 两份文件取时间戳更新的那份：
+//   * Preferences 下那份要沙盒放行才读得到（越狱环境大多放行了，但不保险）；
+//   * 微信自己 Documents 下那份一定有权限，SpringBoard 有跨容器访问权，写得进去。
 static NSString *WXNFrontLine(void) {
-    NSString *s = [NSString stringWithContentsOfFile:@WXN_FRONT_PATH
-                                            encoding:NSUTF8StringEncoding
-                                               error:NULL];
-    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+    NSArray *paths = @[
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wxnotify.front"],
+        @WXN_FRONT_PATH,
+    ];
+    NSString *best = @"";
+    double bestTs = -1;
+    for (NSString *p in paths) {
+        NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:NULL];
+        s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!s.length) continue;
+        NSArray *f = [s componentsSeparatedByString:@"|"];
+        double ts = f.count > 1 ? [f[1] doubleValue] : 0;
+        if (ts > bestTs) { bestTs = ts; best = s; }
+    }
+    return best ?: @"";
 }
 
 static BOOL WXNInWeChat(NSString **whyOut) {
@@ -2158,14 +2173,62 @@ static NSString *WXNFrontmostBundleID(NSString **apiOut) {
     return nil;
 }
 
+// 微信的 Documents 目录。SpringBoard 有跨容器访问权，能拿到别人的沙盒路径；
+// 拿不到（或者微信还没启动过）就只写 Preferences 那份。
+static NSString *gWxDocs = nil;
+static double gWxDocsTry = 0;
+
+static NSString *WXNWeChatDocs(void) {
+    if (gWxDocs) return gWxDocs;
+
+    double now = [[NSDate date] timeIntervalSince1970];
+    if (now - gWxDocsTry < 30.0) return nil;      // 失败别问太勤
+    gWxDocsTry = now;
+
+    Class cls = NSClassFromString(@"LSApplicationProxy");
+    SEL f = NSSelectorFromString(@"applicationProxyForIdentifier:");
+    if (!cls || ![cls respondsToSelector:f]) return nil;
+
+    id proxy = ((id (*)(id, SEL, id))objc_msgSend)(cls, f, @WXN_BUNDLE_ID);
+    if (!proxy) return nil;
+
+    NSURL *url = nil;
+    for (NSString *k in @[ @"dataContainerURL", @"containerURL" ]) {
+        SEL s = NSSelectorFromString(k);
+        if (![proxy respondsToSelector:s]) continue;
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)(proxy, s);
+            if ([v isKindOfClass:[NSURL class]]) { url = v; break; }
+        } @catch (__unused NSException *e) {}
+    }
+    NSString *path = [url path];
+    if (!path.length) return nil;
+
+    NSString *docs = [path stringByAppendingPathComponent:@"Documents"];
+    BOOL isDir = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:docs isDirectory:&isDir] || !isDir) return nil;
+
+    gWxDocs = docs;
+    return docs;
+}
+
 static void WXNFrontTick(void) {
     NSString *api = nil;
     NSString *bundle = WXNFrontmostBundleID(&api);
     double ts = [[NSDate date] timeIntervalSince1970];
     NSString *line = [NSString stringWithFormat:@"%@|%.3f|%d|0|%@",
                       bundle ?: @"(nil)", ts, (int)WXNDeviceLocked(), api ?: @"?"];
-    if ([line isEqualToString:gFrontLastLine] && ts - gFrontLastWrite < 5.0) return;
+
+    // 值没变也至少 2 秒刷一次时间戳：微信那边超过 5 秒没更新就当守卫失联
+    if ([line isEqualToString:gFrontLastLine] && ts - gFrontLastWrite < 2.0) return;
     [line writeToFile:@WXN_FRONT_PATH atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+    NSString *docs = WXNWeChatDocs();
+    if (docs) {
+        [line writeToFile:[docs stringByAppendingPathComponent:@"wxnotify.front"]
+               atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    }
+
     gFrontLastWrite = ts;
     gFrontLastLine = line;
 }

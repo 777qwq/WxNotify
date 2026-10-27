@@ -8,6 +8,7 @@
 """
 import base64
 import json
+import os
 import urllib.error
 import time
 import urllib.request
@@ -118,6 +119,10 @@ def main():
                       {'ref': 'refs/heads/' + BRANCH, 'sha': nc['sha']})
     if st not in (200, 201):
         raise SystemExit(f'更新 ref 失败 {st}: {upd.get("message")}')
+
+    # 记下这次提交，fetch.py 只等它对应的 run，别再拿上一次的旧产物
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.last_sha'), 'w') as f:
+        f.write(nc['sha'])
     print('已推送 ->', BRANCH, nc['sha'][:8])
 
 
