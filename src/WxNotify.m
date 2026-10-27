@@ -74,16 +74,19 @@ static BOOL WXNDebug(void) {
     return c.debug;
 }
 
-// 日志：一份写文件（用户在 Filza 里能直接看），一份走 NSLog
+// 日志：优先写进微信自己的沙盒 Documents（不依赖沙盒越权，Filza 里一定能看到），
+// 写不进去再退到全局 Preferences。
 static NSString *WXNLogPath(void) {
     static NSString *path;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSArray *cands = @[
-            @"/var/mobile/Library/Preferences/cn.qwq.wxnotify.log",
-            @"/var/mobile/Library/Caches/cn.qwq.wxnotify.log",
-        ];
+        NSMutableArray *cands = [NSMutableArray array];
+
+        NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (docs.count) [cands addObject:[docs[0] stringByAppendingPathComponent:@"wxnotify.log"]];
+        [cands addObject:@"/var/mobile/Library/Preferences/wxnotify.log"];
+
         for (NSString *p in cands) {
             NSString *dir = [p stringByDeletingLastPathComponent];
             if ([fm fileExistsAtPath:dir] && [fm isWritableFileAtPath:dir]) {
@@ -149,7 +152,7 @@ static void WXNLoadConfig(void) {
     c.showContent = d[@"showContent"] ? [d[@"showContent"] boolValue] : YES;
     c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
     c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : NO;
-    c.debug       = d[@"debug"]       ? [d[@"debug"] boolValue]       : NO;
+    c.debug       = d[@"debug"]       ? [d[@"debug"] boolValue]       : YES;
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
@@ -589,7 +592,11 @@ static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOr
 
 static IMP gOrigWillPresent;
 
+// 自检通知要能当面弹出来（用户这时往往就在微信里），单独给一个开关
+static BOOL gForceNextBanner = NO;
+
 static BOOL WXNForcePresentation(void) {
+    if (gForceNextBanner) return YES;
     return !WXNAppIsFrontmost();
 }
 
@@ -790,6 +797,29 @@ static void WXNDumpReport(void) {
     WXN_ALOG(@"======== 诊断结束 ========");
 }
 
+// 首次加载后弹一条：不用跑任何命令就能确认库是否生效
+static void WXNPostBootOnce(void) {
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (!docs.count) return;
+    NSString *marker = [docs[0] stringByAppendingPathComponent:@".wxn_boot"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:marker]) return;
+    if (![@"1" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL]) return;
+
+    gForceNextBanner = YES;
+    NSString *where = WXNLogPath() ?: @"(日志没写成功)";
+    WXN_ALOG(@"首次启动，投一条自检通知：%@", where);
+    WXNPost([@"wxn-boot-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
+            @"WxNotify 已加载",
+            [NSString stringWithFormat:@"收到消息会补发横幅。日志：%@", where],
+            @"wxn-boot");
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       gForceNextBanner = NO;
+                   });
+}
+
 __attribute__((constructor))
 static void WXNInit(void) {
     WXN_ALOG(@"======== WxNotify 已加载 pid=%d ========", (int)getpid());
@@ -814,4 +844,18 @@ static void WXNInit(void) {
 
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
+
+    // 用户那边跑不了命令，所以启动后自己写一份诊断到沙盒，并弹一条自检
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXNSetupPresentationHooks();
+                       WXNDumpReport();
+                       WXNPostBootOnce();
+                   });
+    // 有些机器上 CMessageMgr 注册得很晚，20 秒再补一次
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXNSetupPresentationHooks();
+                       WXNDumpReport();
+                   });
 }

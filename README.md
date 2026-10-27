@@ -79,9 +79,17 @@ python3 scripts/package.py --slices out --out dist --ldid ./bin/ldid
 
 ## 日志与自检
 
-日志固定写到 `/var/mobile/Library/Preferences/cn.qwq.wxnotify.log`（写不了就退到
-`/var/mobile/Library/Caches/`），同时走 NSLog。加载、挂钩结果、投递失败总是记；
-每条消息的判断细节需要 `debug=true`。
+日志写在**微信自己的沙盒**里，不需要越权、也不需要敲命令：
+
+```
+/var/mobile/Containers/Data/Application/<微信的 UUID>/Documents/wxnotify.log
+```
+
+（Documents 写不进去才退到 `/var/mobile/Library/Preferences/wxnotify.log`。）
+
+启动 8 秒和 20 秒后会自动写一份完整诊断；装好后第一次打开微信还会弹一条
+「WxNotify 已加载」的自检通知，看到它就说明库已经注进去了。之后每条消息的判断过程
+都会进日志（`debug` 默认开）。
 
 ```sh
 notifyutil -p cn.qwq.wxnotify.diag   # 写一份完整诊断：状态、最前台、钩子、权限、Immortalizer 开关
@@ -102,10 +110,10 @@ notifyutil -p cn.qwq.wxnotify.test   # 投一条测试通知
 | `showContent` | `true` | 横幅显示正文；关掉只显示「你收到一条新消息」 |
 | `sound` | `true` | 提示音 |
 | `respectMute` | `false` | 是否尊重会话免打扰。默认关：这个判断依赖私有选择器，各版本语义没把握，宁可多弹也不漏 |
-| `debug` | `false` | 打日志 |
+| `debug` | `true` | 打日志 |
 
 自检：`notifyutil -p cn.qwq.wxnotify.test` 投一条测试通知，能看到横幅就说明两半都通了。
-`debug` 打开后每条消息的判断过程都会进日志。
+`debug` 打开后每条消息的判断过程都会进日志；排查完可以关掉。
 
 `CMessageMgr` / `CMessageWrap` / `CContactMgr` 都是私有类，所有取值走 `respondsToSelector` + KVC，
 版本对不上时静默降级（例如找不到 `AsyncOnAddMsgForSession:` 时本库什么都不做，不会崩）。
