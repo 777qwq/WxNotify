@@ -24,6 +24,7 @@ FILES = [
     ('scripts/package.py', 'scripts/package.py'),
     ('scripts/push.py', 'scripts/push.py'),
     ('scripts/fetch.py', 'scripts/fetch.py'),
+    ('scripts/upload_wss.py', 'scripts/upload_wss.py'),
     ('README.md', 'README.md'),
     ('.gitignore', '.gitignore'),
     ('build/DEBIAN/control', 'build/DEBIAN/control'),
