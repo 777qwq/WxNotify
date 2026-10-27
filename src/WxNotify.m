@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "1.4"
+#define WXN_VERSION     "1.5"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -880,7 +880,7 @@ static BOOL WXNInstall(void) {
         }
         // 入参不是两个对象的就不碰，否则会把非对象入参当 id 用
         NSMethodSignature *sig = [cls instanceMethodSignatureForSelector:NSSelectorFromString(name)];
-        if (!sig || sig.numberOfArguments != 3 ||
+        if (!sig || sig.numberOfArguments != 4 ||
             strcmp([sig getArgumentTypeAtIndex:2], "@") != 0 ||
             strcmp([sig getArgumentTypeAtIndex:3], "@") != 0) {
             WXN_ALOG(@"%@ 的入参不是两个对象，跳过", name);
