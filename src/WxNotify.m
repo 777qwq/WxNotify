@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.2"
+#define WXN_VERSION     "2.3"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -475,42 +475,40 @@ static BOOL WXNDeviceLocked(void) {
     return v != 0;
 }
 
-// 人是不是已经离开微信了。
-// 沙盒里问不到"谁在最前"（SpringBoard 那条路返回 nil），退一步用"最近有没有碰屏幕"判断。
-static BOOL WXNAwayFromWeChat(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    if (!app) return NO;
-
-    // 只有真的退到后台才交给微信自己（那时它的通知链路是正常的，再补一条会双弹）；
-    // Immortalizer 保活的 Active、锁屏过渡中的 Inactive，都归我们处理。
-    // 注意：假装后台期间读到的 Background 是我们自己骗的，要用真实值。
-    NSInteger st = gFakeBG ? gRealAppState : (NSInteger)app.applicationState;
-    if (st == UIApplicationStateBackground) return NO;
-
-    // 锁屏了肯定要提醒（这一位是 SpringBoard 一直在广播的，沙盒里也读得到）
-    if (WXNDeviceLocked()) return YES;
-
-    // 微信的 scene 有没有被"停用"过：真的切到别的 App / 上滑回桌面时，
-    // SpringBoard 会把 deactivationReasons 推过来，这是唯一不靠猜的信号。
-    // （Immortalizer 会把它抹掉，所以只能看到它抹之前的原值——看到就是看到。）
-    if (gSceneKnown) {
-        // 停用后 2 秒内又碰了屏幕，说明人已经回到微信里
-        if (!gSceneAway) return NO;
-        if (gLastTouch > 0 && CFAbsoluteTimeGetCurrent() - gLastTouch < 2) return NO;
-        return YES;
-    }
-
-    // 拿不到广播（SpringBoard 那半边没装或没起来）才退回触摸判断
-    if (WXNAppIsFrontmost()) return NO;
-    double idle = CFAbsoluteTimeGetCurrent() - gLastTouch;
-    if (gLastTouch > 0 && idle < 15) return NO;
-    return YES;
+// 人是不是就在微信里。
+//
+// 沙盒里问不到"谁在最前"（SBS 那条路返回 nil），所以分两档：
+//   1) scene 停用信号能看到 -> 直接采信（真走了才为真，Immortalizer 抹掉之前我们能看见）
+//   2) 看不到 -> 退回"最近一次碰屏幕"，8 秒内碰过就算人在微信里
+static BOOL WXNUserInWeChat(void) {
+    if (gSceneKnown) return !gSceneAway;
+    if (gLastTouch <= 0) return NO;
+    return (CFAbsoluteTimeGetCurrent() - gLastTouch) < 8.0;
 }
 
 static BOOL WXNShouldNotify(void) {
-    if (!WXNAwayFromWeChat()) return NO;
-    WXN_ALOG(@"  人不在微信里（场景=%d 触摸=%.0f 秒前 锁屏=%d）", gSceneAway,
-             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1, WXNDeviceLocked());
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return NO;
+
+    // 真的退到后台（没装 Immortalizer 或它没生效）就交给微信自己，别双弹
+    NSInteger st = gFakeBG ? gRealAppState : (NSInteger)app.applicationState;
+    if (st == UIApplicationStateBackground) return NO;
+
+    // 锁屏了：肯定要提醒，这时候触摸记录没有意义
+    if (WXNDeviceLocked()) {
+        WXN_ALOG(@"  锁屏中，要提醒");
+        return YES;
+    }
+
+    if (WXNUserInWeChat()) {
+        WXN_ALOG(@"  跳过：人就在微信里（场景 known=%d away=%d，%.1f 秒前碰过屏幕）",
+                 (int)gSceneKnown, (int)gSceneAway,
+                 gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1);
+        return NO;
+    }
+    WXN_ALOG(@"  人不在微信里（场景 known=%d away=%d，%.1f 秒前碰过屏幕）",
+             (int)gSceneKnown, (int)gSceneAway,
+             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1);
     return YES;
 }
 
@@ -543,7 +541,6 @@ static void WXNSetupPresentationHooks(void);
 static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig);
 static void WXNBeginFakeBackground(NSString *why);
 static void WXNEndFakeBackground(NSString *why);
-static BOOL WXNAwayFromWeChat(void);
 static void WXNDumpDelivered(NSString *tag);
 
 // 微信的富消息（表情/图片/链接）正文是 XML，直接当通知正文会很难看
@@ -585,6 +582,55 @@ static NSNumber *WXNUnreadCount(void) {
         }
     }
     return nil;
+}
+
+// ---------------------------------------------------------------------------
+// 角标
+//
+// 2.2 的日志：同一轮里两次都打出 "角标：0 -> 1"，说明投递完系统的
+// applicationIconBadgeNumber 并不会回写，读它永远是旧值，角标就永远停在 1。
+// 改成自己数：每投一条 +1，用户回到微信（碰屏幕）或者微信自己清零时归零。
+// ---------------------------------------------------------------------------
+
+static NSInteger gBadge = -1;
+
+static NSString *WXNBadgePath(void) {
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!dir.length) dir = NSTemporaryDirectory();
+    return [dir stringByAppendingPathComponent:@".wxn_badge"];
+}
+
+static void WXNBadgeWrite(void) {
+    NSString *p = WXNBadgePath();
+    [[NSString stringWithFormat:@"%ld", (long)(gBadge < 0 ? 0 : gBadge)]
+        writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
+static NSInteger WXNBadgeNext(void) {
+    if (gBadge < 0) {
+        NSString *v = [NSString stringWithContentsOfFile:WXNBadgePath()
+                                                encoding:NSUTF8StringEncoding
+                                                   error:NULL];
+        gBadge = v ? [v integerValue] : 0;
+    }
+    gBadge += 1;
+    WXNBadgeWrite();
+    return gBadge;
+}
+
+// 前台被系统吞掉（没弹没响）时把这一条退回去，别让图标数字虚高
+static void WXNBadgeRollback(NSString *why) {
+    if (gBadge <= 0) return;
+    gBadge -= 1;
+    WXNBadgeWrite();
+    WXN_ALOG(@"角标回退到 %ld（%@）", (long)gBadge, why);
+}
+
+static void WXNBadgeReset(NSString *why) {
+    if (gBadge == 0) return;
+    WXN_ALOG(@"角标归零（%@，之前 %ld）", why, (long)gBadge);
+    gBadge = 0;
+    WXNBadgeWrite();
 }
 
 // 把微信自己那条提示音拷到 Library/Sounds，让通知用它
@@ -724,11 +770,10 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
     if (thread.length) content.threadIdentifier = thread;
     content.userInfo = @{ @"wxsession": thread ?: @"" };
 
-    // 角标：微信被保活时自己从不设角标，这里在系统当前值上加一
-    NSInteger curBadge = (NSInteger)[UIApplication sharedApplication].applicationIconBadgeNumber;
-    NSInteger nextBadge = curBadge + 1;
+    // 角标：微信被保活时自己从不设角标，这里自己数
+    NSInteger nextBadge = WXNBadgeNext();
     content.badge = @(nextBadge);
-    WXN_ALOG(@"角标：%ld -> %ld", (long)curBadge, (long)nextBadge);
+    WXN_ALOG(@"角标：-> %ld", (long)nextBadge);
 
     UNNotificationContent *payload = content;
     if (c.avatar && senderUsr.length) {
@@ -959,9 +1004,6 @@ static IMP gOrigForSessionNotify; // AsyncOnAddMsgForSession:MsgWrap:NewMsgArriv
 static NSMutableArray *gHookNames;  // 已挂上的消息钩子
 
 static void WXNForSessionNotify(id self, SEL _cmd, id session, id wrap, BOOL notify) {
-    if (WXNConfigCopy().enabled && notify && WXNAwayFromWeChat()) {
-        WXNBeginFakeBackground(@"AsyncOnAddMsgForSession");
-    }
     if (gOrigForSessionNotify) {
         ((void (*)(id, SEL, id, id, BOOL))gOrigForSessionNotify)(self, _cmd, session, wrap, notify);
     }
@@ -1003,9 +1045,6 @@ static void WXNMsgHook2(id self, SEL _cmd, id a1, id a2) {
     pthread_mutex_lock(&gOrigLock);
     orig = (IMP)[[gOrigMap objectForKey:name] pointerValue];
     pthread_mutex_unlock(&gOrigLock);
-    // 人不在微信里时先"假装后台"，让微信自己去发原生通知
-    if (WXNConfigCopy().enabled && WXNAwayFromWeChat()) WXNBeginFakeBackground(name);
-
     if (orig) ((void (*)(id, SEL, id, id))orig)(self, _cmd, a1, a2);
 
     @autoreleasepool {
@@ -1077,24 +1116,29 @@ static BOOL WXNForcePresentation(void) {
 
 static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
                            void (^completion)(NSUInteger)) {
-    WXN_ALOG(@"[willPresent] 进入 %@ force=%d frontmost=%@",
-             NSStringFromClass(object_getClass(self)), (int)gForceNextBanner,
-             WXNCurrentFrontmostBundle() ?: @"(未知)");
-    if (WXNForcePresentation()) {
-        NSUInteger opts = UNNotificationPresentationOptionBanner |
-                          UNNotificationPresentationOptionList |
-                          UNNotificationPresentationOptionSound |
-                          UNNotificationPresentationOptionBadge;
-        WXN_ALOG(@"前台呈现 -> 强制横幅+声音+角标");
-        if (completion) completion(opts);
+    BOOL inWeChat = !gForceNextBanner && WXNUserInWeChat();
+
+    // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
+    // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
+    // 人不在微信里 -> 给足横幅+声音+角标，别被 Immortalizer 那个开关吃掉。
+    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 强制=%d 场景 known=%d away=%d 触摸=%.1f 秒前",
+             NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)gForceNextBanner,
+             (int)gSceneKnown, (int)gSceneAway,
+             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1);
+
+    if (inWeChat) {
+        WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
+        WXNBadgeRollback(@"前台静默");
+        if (completion) completion(UNNotificationPresentationOptionNone);
         return;
     }
-    if (gOrigWillPresent) {
-        ((void (*)(id, SEL, id, id, void (^)(NSUInteger)))gOrigWillPresent)(self, _cmd, center,
-                                                                         notification, completion);
-    } else if (completion) {
-        completion(UNNotificationPresentationOptionNone);
-    }
+
+    NSUInteger opts = UNNotificationPresentationOptionBanner |
+                      UNNotificationPresentationOptionList |
+                      UNNotificationPresentationOptionSound |
+                      UNNotificationPresentationOptionBadge;
+    WXN_ALOG(@"前台呈现 -> 强制横幅+声音+角标");
+    if (completion) completion(opts);
 }
 
 static void WXNHookDelegateClass(Class cls) {
@@ -1338,10 +1382,22 @@ static BOOL WXNInstall(void) {
 // 换个办法——记下「人刚才有没有碰过屏幕」，十几秒内碰过就当人在微信里。
 static void (*gOrigSendEvent)(id, SEL, UIEvent *);
 
+static void (*gOrigSetBadge)(id, SEL, NSInteger);
+
+static void WXNSetBadge(id self, SEL _cmd, NSInteger n) {
+    if (n == 0) WXNBadgeReset(@"微信自己清零");
+    if (gOrigSetBadge) gOrigSetBadge(self, _cmd, n);
+}
+
 static void WXNSendEvent(id self, SEL _cmd, UIEvent *event) {
     @try {
         if ([event isKindOfClass:NSClassFromString(@"UITouchesEvent")]) {
             gLastTouch = CFAbsoluteTimeGetCurrent();
+            // 人在微信里动手了，就当未读已经看过了：角标归零，图标上的数字也跟着清
+            if (gBadge > 0) {
+                WXNBadgeReset(@"回到微信");
+                if (gOrigSetBadge) gOrigSetBadge(self, @selector(setApplicationIconBadgeNumber:), 0);
+            }
         }
     } @catch (...) {}
     if (gOrigSendEvent) gOrigSendEvent(self, _cmd, event);
@@ -1351,7 +1407,9 @@ static void WXNInstallTouch(void) {
     Class cls = NSClassFromString(@"UIApplication");
     if (!cls) { WXN_ALOG(@"屏幕触摸钩子：找不到 UIApplication"); return; }
     BOOL ok = WXNSwizzle(cls, @"sendEvent:", (IMP)WXNSendEvent, &gOrigSendEvent);
-    WXN_ALOG(@"屏幕触摸钩子：%@", ok ? @"已挂" : @"没挂上");
+    WXNSwizzle(cls, @"setApplicationIconBadgeNumber:", (IMP)WXNSetBadge, &gOrigSetBadge);
+    WXN_ALOG(@"屏幕触摸钩子：%@；角标钩子：%@", ok ? @"已挂" : @"没挂上",
+             gOrigSetBadge ? @"已挂" : @"没挂上");
 }
 
 // 类可能比 dylib 的 constructor 晚就绪，最多重试 20 次（约 10 秒）
