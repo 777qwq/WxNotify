@@ -1,0 +1,5 @@
+#!/bin/sh
+# 装完把微信杀掉，下次启动才会注入 WxNotify
+killall -9 WeChat >/dev/null 2>&1
+[ -x /var/jb/usr/bin/killall ] && /var/jb/usr/bin/killall -9 WeChat >/dev/null 2>&1
+exit 0

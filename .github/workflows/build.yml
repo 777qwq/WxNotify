@@ -1,0 +1,50 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path); echo "SDK=$SDK"
+
+      - name: Build thin slices
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+
+          for ARCH in arm64 arm64e; do
+            clang -target ${ARCH}-apple-ios15.0 -isysroot "$SDK" \
+              -include stdlib.h -include string.h \
+              -fobjc-arc -O2 -dynamiclib -fno-omit-frame-pointer \
+              -framework UIKit -framework Foundation -framework UserNotifications -ldl \
+              -Wl,-undefined,dynamic_lookup \
+              -install_name /var/jb/Library/MobileSubstrate/DynamicLibraries/WxNotify.dylib \
+              -o WxNotify-${ARCH}.dylib src/WxNotify.m
+          done
+
+          lipo -info *.dylib
+          ls -la *.dylib
+          for f in *.dylib; do
+            echo "==== $f"
+            otool -hv "$f" | tail -3
+            otool -l "$f" | grep -E "LC_BUILD_VERSION|LC_DYLD_CHAINED_FIXUPS|LC_DYLD_INFO_ONLY" || true
+          done
+          echo "==== 私有类抽查"; (strings -a WxNotify-arm64.dylib | grep -c "CMessageMgr\|CContactMgr\|CMessageWrap" || true)
+          echo "==== 钩子抽查"; (strings -a WxNotify-arm64.dylib | grep -c "AsyncOnAddMsgForSession" || true)
+          echo "==== 前台判断"; (strings -a WxNotify-arm64.dylib | grep -c "SBSCopyFrontmostApplicationDisplayIdentifier" || true)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dylib
+          path: |
+            WxNotify-arm64.dylib
+            WxNotify-arm64e.dylib
