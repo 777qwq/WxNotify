@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "1.8"
+#define WXN_VERSION     "1.9"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -55,12 +55,16 @@ typedef struct {
     BOOL enabled;      // 总开关
     BOOL showContent;  // 显示消息正文；关掉就只显示"你收到一条新消息"
     BOOL sound;        // 播放提示音
-    BOOL respectMute;  // 尊重微信的会话免打扰（默认关，宁可多弹也不要漏）
+    BOOL respectMute;  // 尊重微信的会话免打扰
+    BOOL avatar;       // 用系统通讯通知显示发送者头像
     BOOL debug;        // 打日志
 } WXNConfig;
 
 static WXNConfig gCfg;
 static pthread_mutex_t gCfgLock = PTHREAD_MUTEX_INITIALIZER;
+
+// 上一次用户碰微信屏幕的时刻，用来判断「人是不是正在微信里」
+static double gLastTouch = 0;
 
 
 static WXNConfig WXNConfigCopy(void) {
@@ -153,14 +157,15 @@ static void WXNLoadConfig(void) {
     c.enabled     = d[@"enabled"]     ? [d[@"enabled"] boolValue]     : YES;
     c.showContent = d[@"showContent"] ? [d[@"showContent"] boolValue] : YES;
     // 默认静音：提示音交给微信自己那一声，避免一声消息两声提示
-    c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : NO;
-    c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : NO;
+    c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
+    c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : YES;
+    c.avatar      = d[@"avatar"]      ? [d[@"avatar"] boolValue]      : NO;
     c.debug       = d[@"debug"]       ? [d[@"debug"] boolValue]       : YES;
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
-    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d debug=%d",
-            c.enabled, c.showContent, c.sound, c.respectMute, c.debug);
+    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d debug=%d",
+            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.debug);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +360,7 @@ static NSString *WXNTrim(NSString *s, NSUInteger max) {
     return [[s substringToIndex:max] stringByAppendingString:@"…"];
 }
 
-// 微信自己的「消息免打扰」。默认不采信（尊重它就设 respectMute=1），
-// 因为这个选择器在不同版本里的语义没有百分百把握，宁可按"没免打扰"处理。
+// 微信自己的「消息免打扰」。默认采信（respectMute=1），免打扰的会话不提醒。
 static BOOL WXNIsMuted(id msgMgr, id wrap) {
     WXNConfig c = WXNConfigCopy();
     if (!c.respectMute) return NO;
@@ -365,6 +369,7 @@ static BOOL WXNIsMuted(id msgMgr, id wrap) {
     if (!msgMgr || ![msgMgr respondsToSelector:s]) return NO;
     @try {
         BOOL open = ((BOOL (*)(id, SEL, id))objc_msgSend)(msgMgr, s, wrap);
+        WXN_ALOG(@"  免打扰探测：isChatStatusNotifyOpenForMsgWrap=%d", open);
         return open ? NO : YES;
     } @catch (__unused NSException *e) {
         return NO;
@@ -441,6 +446,13 @@ static BOOL WXNShouldNotify(void) {
     // 人就在微信里就别弹
     if (WXNAppIsFrontmost()) return NO;
 
+    // 前台探测在沙盒里拿不到，退一步：十几秒内刚在微信里点过，就当人在微信里
+    double idle = CFAbsoluteTimeGetCurrent() - gLastTouch;
+    if (gLastTouch > 0 && idle < 15) {
+        WXN_ALOG(@"  跳过：%.0f 秒前还在微信里操作", idle);
+        return NO;
+    }
+
     return YES;
 }
 
@@ -511,6 +523,44 @@ static NSNumber *WXNUnreadCount(void) {
         }
     }
     return nil;
+}
+
+// 把微信自己那条提示音拷到 Library/Sounds，让通知用它
+static NSString *WXNToneName(void) {
+    static NSString *name;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *bundle = [[NSBundle mainBundle] bundlePath];
+        NSArray *list = [fm contentsOfDirectoryAtPath:bundle error:NULL];
+        NSMutableArray *found = [NSMutableArray array];
+        for (NSString *f in list) {
+            NSString *ext = [f.pathExtension lowercaseString];
+            if ([ext isEqualToString:@"caf"] || [ext isEqualToString:@"wav"]) [found addObject:f];
+        }
+        WXN_ALOG(@"包根目录音频：%@", found.count ? [found componentsJoinedByString:@", "] : @"(没有)");
+
+        NSArray *prefer = @[@"in.caf", @"msg.caf", @"newmsg.caf", @"notify.caf",
+                            @"message.caf", @"in.wav", @"msg.wav"];
+        NSString *pick = nil;
+        for (NSString *p in prefer) {
+            if ([found containsObject:p]) { pick = p; break; }
+        }
+        if (!pick && found.count) pick = found.firstObject;
+        if (!pick) return;
+
+        NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *sounds = [lib stringByAppendingPathComponent:@"Sounds"];
+        [fm createDirectoryAtPath:sounds withIntermediateDirectories:YES attributes:nil error:NULL];
+        NSString *dst = [[sounds stringByAppendingPathComponent:@"wxn-tone"]
+                         stringByAppendingPathExtension:pick.pathExtension];
+        [fm removeItemAtPath:dst error:NULL];
+        if ([fm copyItemAtPath:[bundle stringByAppendingPathComponent:pick] toPath:dst error:NULL]) {
+            name = dst.lastPathComponent;
+        }
+        WXN_ALOG(@"提示音选用：%@ -> %@", pick, name ?: @"(拷贝失败)");
+    });
+    return name;
 }
 
 // 自己的 wxid，群聊通讯通知要用它当收件人
@@ -602,15 +652,22 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
     content.title = title.length ? title : @"微信";
     if (subtitle.length) content.subtitle = subtitle;
     content.body = body.length ? body : @"新消息";
-    if (c.sound) content.sound = [UNNotificationSound defaultSound];
+    if (c.sound) {
+        NSString *tone = WXNToneName();
+        content.sound = tone.length ? [UNNotificationSound soundNamed:tone]
+                                    : [UNNotificationSound defaultSound];
+    }
     if (thread.length) content.threadIdentifier = thread;
     content.userInfo = @{ @"wxsession": thread ?: @"" };
 
-    NSNumber *unread = WXNUnreadCount();
-    if (unread) content.badge = unread;
+    // 角标：微信被保活时自己从不设角标，这里在系统当前值上加一
+    NSInteger curBadge = (NSInteger)[UIApplication sharedApplication].applicationIconBadgeNumber;
+    NSInteger nextBadge = curBadge + 1;
+    content.badge = @(nextBadge);
+    WXN_ALOG(@"角标：%ld -> %ld", (long)curBadge, (long)nextBadge);
 
     UNNotificationContent *payload = content;
-    if (senderUsr.length) {
+    if (c.avatar && senderUsr.length) {
         NSString *nick = WXNDisplayName(senderUsr) ?: subtitle;
         UNNotificationContent *c2 = WXNCommunicationContent(content, senderUsr, nick, isGroup, thread);
         if (c2) payload = c2;
@@ -1052,6 +1109,26 @@ static BOOL WXNInstall(void) {
     return any;
 }
 
+// 微信在前台时不要弹系统横幅：沙盒里查不到「谁在最前」，
+// 换个办法——记下「人刚才有没有碰过屏幕」，十几秒内碰过就当人在微信里。
+static void (*gOrigSendEvent)(id, SEL, UIEvent *);
+
+static void WXNSendEvent(id self, SEL _cmd, UIEvent *event) {
+    @try {
+        if ([event isKindOfClass:NSClassFromString(@"UITouchesEvent")]) {
+            gLastTouch = CFAbsoluteTimeGetCurrent();
+        }
+    } @catch (...) {}
+    if (gOrigSendEvent) gOrigSendEvent(self, _cmd, event);
+}
+
+static void WXNInstallTouch(void) {
+    Class cls = NSClassFromString(@"UIApplication");
+    if (!cls) { WXN_ALOG(@"屏幕触摸钩子：找不到 UIApplication"); return; }
+    BOOL ok = WXNSwizzle(cls, @"sendEvent:", (IMP)WXNSendEvent, &gOrigSendEvent);
+    WXN_ALOG(@"屏幕触摸钩子：%@", ok ? @"已挂" : @"没挂上");
+}
+
 // 类可能比 dylib 的 constructor 晚就绪，最多重试 20 次（约 10 秒）
 static void WXNInstallWithRetry(int attempt) {
     if (WXNInstall()) {
@@ -1220,6 +1297,7 @@ static void WXNInit(void) {
         WXNDumpReport();
     });
 
+    WXNInstallTouch();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
 
