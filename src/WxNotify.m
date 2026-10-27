@@ -1084,7 +1084,8 @@ static void WXNSetupWithRetry(int attempt) {
 
 static void WXNPostTest(void) {
     WXNPost([@"wxn-test-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
-            @"微信后台通知", @"如果你看到这条横幅，说明两半都通了。", @"wxn-test");
+            @"微信后台通知", nil, @"如果你看到这条横幅，说明两半都通了。",
+            @"wxn-test", nil, NO);
 }
 
 // 诊断：notifyutil -p cn.qwq.wxnotify.diag
