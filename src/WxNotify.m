@@ -38,14 +38,12 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.1"
+#define WXN_VERSION     "2.2"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
 #define WXN_DIAG_NOT    "cn.qwq.wxnotify.diag"
-#define WXN_SB_FRONT_NOT "cn.qwq.wxnotify.sbfront"   // SpringBoard 广播"谁在最前面"
-#define WXN_SB_VALID     0x10000ULL                  // 状态里的"有效"标记
-#define WXN_SB_LOG_PATH  "/var/mobile/Library/Preferences/wxnotify-sb.log"
+#define WXN_DEACT_NOT   "cn.qwq.wxnotify.deact"      // 场景被停用时广播一下（调试用）
 
 // 通知里显示的内容上限，防止超长消息把横幅撑爆
 #define WXN_BODY_MAX    240
@@ -69,6 +67,13 @@ static pthread_mutex_t gCfgLock = PTHREAD_MUTEX_INITIALIZER;
 
 // 上一次用户碰微信屏幕的时刻，用来判断「人是不是正在微信里」
 static double gLastTouch = 0;
+
+// 微信 scene 的"被停用"信号：真的切去别的 App、上滑回桌面时才会出现。
+// 沙盒里问不到最前台是谁（SBS 那条路返回 nil），这条是唯一不靠猜的线索。
+// gSceneKnown=0 表示一次都没收到过（比如被 Immortalizer 全抹了），那就退回触摸判断。
+static volatile BOOL gSceneKnown = NO;
+static volatile BOOL gSceneAway = NO;
+static volatile unsigned long long gLastDeactReasons = 0;
 
 // 「假装在后台」：只在消息到达的那一小段时间里，让微信读到 Background，
 // 它就会走自己那条原生通知分支（标题/正文/角标/提示音/免打扰全是原生的）。
@@ -457,21 +462,6 @@ static BOOL WXNAppIsFrontmost(void) {
     return [b isEqualToString:@WXN_BUNDLE_ID];
 }
 
-// 读 SpringBoard 广播出来的"谁在最前面"。
-// 返回 -1 = 没有可用信号（那就退回触摸判断）；否则 bit0=微信在前台, bit1=锁屏
-static int WXNSBFrontState(void) {
-    static int tok = -1;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        if (notify_register_check(WXN_SB_FRONT_NOT, &tok) != NOTIFY_STATUS_OK) tok = -1;
-    });
-    if (tok < 0) return -1;
-    uint64_t v = 0;
-    if (notify_get_state(tok, &v) != NOTIFY_STATUS_OK) return -1;
-    if (!(v & WXN_SB_VALID)) return -1;
-    return (int)(v & 3);
-}
-
 // 锁屏状态：SpringBoard 一直在广播这一位，沙盒里也读得到
 static BOOL WXNDeviceLocked(void) {
     static int tok = -1;
@@ -497,13 +487,17 @@ static BOOL WXNAwayFromWeChat(void) {
     NSInteger st = gFakeBG ? gRealAppState : (NSInteger)app.applicationState;
     if (st == UIApplicationStateBackground) return NO;
 
-    // 有 SpringBoard 广播就用它，这是唯一准确的答案
-    int sb = WXNSBFrontState();
-    if (sb >= 0) {
-        BOOL inWeChat = (sb & 1) != 0;
-        BOOL locked = (sb & 2) != 0 || WXNDeviceLocked();
-        if (!inWeChat) return YES;     // 人在别的 App / 桌面
-        return locked;                 // 在微信里但屏幕已经锁了，还是要提醒
+    // 锁屏了肯定要提醒（这一位是 SpringBoard 一直在广播的，沙盒里也读得到）
+    if (WXNDeviceLocked()) return YES;
+
+    // 微信的 scene 有没有被"停用"过：真的切到别的 App / 上滑回桌面时，
+    // SpringBoard 会把 deactivationReasons 推过来，这是唯一不靠猜的信号。
+    // （Immortalizer 会把它抹掉，所以只能看到它抹之前的原值——看到就是看到。）
+    if (gSceneKnown) {
+        // 停用后 2 秒内又碰了屏幕，说明人已经回到微信里
+        if (!gSceneAway) return NO;
+        if (gLastTouch > 0 && CFAbsoluteTimeGetCurrent() - gLastTouch < 2) return NO;
+        return YES;
     }
 
     // 拿不到广播（SpringBoard 那半边没装或没起来）才退回触摸判断
@@ -515,7 +509,7 @@ static BOOL WXNAwayFromWeChat(void) {
 
 static BOOL WXNShouldNotify(void) {
     if (!WXNAwayFromWeChat()) return NO;
-    WXN_ALOG(@"  人不在微信里（SB=%d 触摸=%.0f 秒前 锁屏=%d）", WXNSBFrontState(),
+    WXN_ALOG(@"  人不在微信里（场景=%d 触摸=%.0f 秒前 锁屏=%d）", gSceneAway,
              gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1, WXNDeviceLocked());
     return YES;
 }
@@ -546,6 +540,7 @@ static BOOL WXNSeenBefore(NSString *key) {
 // ---------------------------------------------------------------------------
 
 static void WXNSetupPresentationHooks(void);
+static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig);
 static void WXNBeginFakeBackground(NSString *why);
 static void WXNEndFakeBackground(NSString *why);
 static BOOL WXNAwayFromWeChat(void);
@@ -765,6 +760,60 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
 }
 
 // 原生优先：先让微信自己发，它不发我们再补
+// ---------------------------------------------------------------------------
+// 场景停用信号
+//
+// SpringBoard 在用户切走 / 上滑回桌面 / 锁屏时，会通过 FBScene 把
+// deactivationReasons 推给应用。Immortalizer 就是在这里把它抹掉的。
+// 我们不去改它（改了就没保活了），只在它抹之前看一眼：看到了，就说明人真的走了。
+// ---------------------------------------------------------------------------
+
+static void (*gOrigSetDeactReasons)(id, SEL, unsigned long long);
+static void (*gOrigUpdateSettings)(id, SEL, id, id, id);
+
+static void WXNNoteDeactReasons(unsigned long long r, NSString *where) {
+    if (r) {
+        if (!gSceneAway) WXN_ALOG(@"场景停用：reasons=0x%llx（%@）", r, where);
+        gSceneAway = YES;
+        gLastDeactReasons = r;
+    } else {
+        if (gSceneAway) WXN_ALOG(@"场景恢复：reasons=0（%@）", where);
+        gSceneAway = NO;
+        gLastDeactReasons = 0;
+    }
+    gSceneKnown = YES;
+}
+
+static void WXNSetDeactReasons(id self, SEL _cmd, unsigned long long reasons) {
+    @try { WXNNoteDeactReasons(reasons, @"setDeactivationReasons"); } @catch (__unused NSException *e) {}
+    if (gOrigSetDeactReasons) gOrigSetDeactReasons(self, _cmd, reasons);
+}
+
+static void WXNUpdateSettings(id self, SEL _cmd, id settings, id ctx, id completion) {
+    @try {
+        SEL sel = NSSelectorFromString(@"deactivationReasons");
+        if (settings && [settings respondsToSelector:sel]) {
+            unsigned long long r = ((unsigned long long (*)(id, SEL))objc_msgSend)(settings, sel);
+            WXNNoteDeactReasons(r, @"updateSettings");
+        }
+    } @catch (__unused NSException *e) {}
+    if (gOrigUpdateSettings) gOrigUpdateSettings(self, _cmd, settings, ctx, completion);
+}
+
+static void WXNInstallSceneProbe(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class s1 = NSClassFromString(@"UIMutableApplicationSceneSettings");
+        if (s1) WXNSwizzle(s1, @"setDeactivationReasons:", (IMP)WXNSetDeactReasons, &gOrigSetDeactReasons);
+        Class s2 = NSClassFromString(@"FBScene");
+        if (s2) WXNSwizzle(s2, @"updateSettings:withTransitionContext:completion:",
+                          (IMP)WXNUpdateSettings, &gOrigUpdateSettings);
+        WXN_ALOG(@"场景停用探针：settings=%@ scene=%@",
+                 gOrigSetDeactReasons ? @"已挂" : @"没挂",
+                 gOrigUpdateSettings ? @"已挂" : @"没挂");
+    });
+}
+
 static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
                        NSString *thread, NSString *senderUsr, BOOL isGroup) {
     if (!gFakeBG) {
@@ -1352,8 +1401,9 @@ static void WXNDumpReport(void) {
     UIApplication *app = [UIApplication sharedApplication];
     WXN_ALOG(@"applicationState=%ld（0=Active 1=Inactive 2=Background）", (long)app.applicationState);
     WXN_ALOG(@"最前台应用=%@", WXNCurrentFrontmostBundle() ?: @"(取不到)");
-    WXN_ALOG(@"SpringBoard 广播=%d（-1=没信号 0=不在微信 1=微信在前 2/3=锁屏）锁屏=%d",
-             WXNSBFrontState(), WXNDeviceLocked());
+    WXN_ALOG(@"场景信号：known=%d away=%d reasons=0x%llx（0=能看到 1=被 Immortalizer 全抹了）",
+             (int)gSceneKnown, (int)gSceneAway, (unsigned long long)gLastDeactReasons);
+    WXN_ALOG(@"锁屏=%d", WXNDeviceLocked());
     WXN_ALOG(@"backgroundTimeRemaining=%.0f protectedData=%d",
              app.backgroundTimeRemaining, (int)app.protectedDataAvailable);
     @try {
@@ -1467,171 +1517,12 @@ static void WXNPostBootOnce(void) {
                    });
 }
 
-// ===========================================================================
-// SpringBoard 半边
-//
-// 微信自己的沙盒里问不到"现在屏幕上是谁"（SBSCopyFrontmostApplicationDisplayIdentifier
-// 返回 nil），猜也不可靠（2.0 用"最近有没有碰屏幕"猜，结果人在外面时还在往微信上算）。
-// 所以同一份 dylib 也注进 SpringBoard：它天然知道最前面的应用是谁、屏幕锁没锁，
-// 每秒把这些状态用 Darwin 通知广播一次，微信侧读一下就知道该不该弹。
-//
-// 这一半刻意做到最"怂"：不做任何 swizzle，不碰别人的类，全程 @try，
-// 任何一步拿不到就放弃，最坏情况只是广播不出去，微信侧退回旧判断。
-// ===========================================================================
-
-static void WXNSBLog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.dateFormat = @"MM-dd HH:mm:ss";
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [df stringFromDate:[NSDate date]], msg];
-    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:@WXN_SB_LOG_PATH];
-    if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:@WXN_SB_LOG_PATH contents:d attributes:nil];
-        return;
-    }
-    @try {
-        [fh seekToEndOfFile];
-        [fh writeData:d];
-        [fh closeFile];
-    } @catch (__unused NSException *e) {}
-}
-
-// 最前面的应用：把能想到的接口挨个试一遍，哪个能出结果就用哪个
-static NSString *WXNSBFrontmost(void) {
-    @try {
-        typedef CFStringRef (*WXNCopyFn)(void);
-        static WXNCopyFn copyFn;
-        static BOOL probed = NO;
-        if (!probed) {
-            probed = YES;
-            copyFn = (WXNCopyFn)dlsym(RTLD_DEFAULT, "SBSCopyFrontmostApplicationDisplayIdentifier");
-            WXNSBLog(@"dlsym SBSCopyFrontmostApplicationDisplayIdentifier = %p", (void *)copyFn);
-        }
-        if (copyFn) {
-            CFStringRef cs = copyFn();
-            if (cs) {
-                NSString *r = [(__bridge NSString *)cs copy];
-                CFRelease(cs);
-                if (r.length) return r;
-            }
-        }
-
-        Class sbCls = objc_getClass("SpringBoard");
-        id app = nil;
-        if (sbCls && [sbCls respondsToSelector:@selector(sharedApplication)]) {
-            app = ((id (*)(id, SEL))objc_msgSend)(sbCls, @selector(sharedApplication));
-        }
-        if (!app) app = [UIApplication sharedApplication];
-
-        for (NSString *n in @[@"frontmostApplicationDisplayIdentifier",
-                              @"_frontmostApplicationDisplayIdentifier",
-                              @"frontmostApplicationBundleIdentifier"]) {
-            SEL sel = NSSelectorFromString(n);
-            if (app && [app respondsToSelector:sel]) {
-                id v = ((id (*)(id, SEL))objc_msgSend)(app, sel);
-                if ([v isKindOfClass:[NSString class]] && [v length]) return v;
-            }
-        }
-        if (app && [app respondsToSelector:@selector(frontmostApplication)]) {
-            id fa = ((id (*)(id, SEL))objc_msgSend)(app, @selector(frontmostApplication));
-            for (NSString *n in @[@"bundleIdentifier", @"displayIdentifier", @"applicationIdentifier"]) {
-                SEL sel = NSSelectorFromString(n);
-                if (fa && [fa respondsToSelector:sel]) {
-                    id v = ((id (*)(id, SEL))objc_msgSend)(fa, sel);
-                    if ([v isKindOfClass:[NSString class]] && [v length]) return v;
-                }
-            }
-        }
-    } @catch (__unused NSException *e) {
-        WXNSBLog(@"取最前台应用抛异常：%@", e.reason);
-    }
-    return nil;
-}
-
-static BOOL WXNSBLocked(void) {
-    @try {
-        Class cls = objc_getClass("SBLockScreenManager");
-        id inst = nil;
-        if (cls && [cls respondsToSelector:@selector(sharedInstanceIfExists)]) {
-            inst = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(sharedInstanceIfExists));
-        }
-        if (!inst && cls && [cls respondsToSelector:@selector(sharedInstance)]) {
-            inst = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(sharedInstance));
-        }
-        for (NSString *n in @[@"isLockScreenVisible", @"isUILocked", @"isLockScreenShowing"]) {
-            SEL sel = NSSelectorFromString(n);
-            if (inst && [inst respondsToSelector:sel]) {
-                return ((BOOL (*)(id, SEL))objc_msgSend)(inst, sel);
-            }
-        }
-    } @catch (__unused NSException *e) {}
-    return NO;
-}
-
-static void WXNSBPoll(void);
-
-static void WXNSBScheduleNext(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                       WXNSBPoll();
-                   });
-}
-
-static void WXNSBPoll(void) {
-    static int tok = -2;
-    static NSString *lastFront = nil;
-    @try {
-        if (tok == -2) {
-            tok = -1;
-            if (notify_register_check(WXN_SB_FRONT_NOT, &tok) == NOTIFY_STATUS_OK) {
-                WXNSBLog(@"Darwin 通道就绪 token=%d", tok);
-            } else {
-                tok = -1;
-                WXNSBLog(@"Darwin 通道注册失败");
-            }
-        }
-
-        NSString *front = WXNSBFrontmost();
-        BOOL locked = WXNSBLocked();
-
-        uint64_t v = 0;
-        if (front.length) {
-            v = WXN_SB_VALID | (locked ? 2 : 0);
-            if ([front isEqualToString:@WXN_BUNDLE_ID]) v |= 1;
-        }
-        if (tok >= 0) {
-            notify_set_state(tok, v);
-            notify_post(WXN_SB_FRONT_NOT);
-        }
-
-        if (![front isEqualToString:lastFront]) {
-            lastFront = [front copy];
-            WXNSBLog(@"最前面=%@ 锁屏=%d 广播值=0x%llx", front ?: @"(取不到)", locked,
-                     (unsigned long long)v);
-        }
-    } @catch (__unused NSException *e) {
-        WXNSBLog(@"轮询异常：%@", e.reason);
-    }
-    WXNSBScheduleNext();
-}
-
-static void WXNStartSpringBoard(void) {
-    WXNSBLog(@"======== WxNotify %s 的 SpringBoard 半边已加载 ========", WXN_VERSION);
-    WXNSBScheduleNext();
-}
-
 __attribute__((constructor))
 static void WXNInit(void) {
-    // 同一份 dylib 注进两个进程：SpringBoard 只跑广播那半边，别的代码一行都不碰
+    // 硬保险：不是微信就什么都不做。filter 里只写了 com.tencent.xin，
+    // 但万一哪天有人把它注进 SpringBoard，这里立刻退出，绝不碰系统进程。
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    if ([bid isEqualToString:@"com.apple.springboard"]) {
-        WXNStartSpringBoard();
-        return;
-    }
+    if (![bid isEqualToString:@WXN_BUNDLE_ID]) return;
 
     WXN_ALOG(@"======== WxNotify %s 已加载 pid=%d ========", WXN_VERSION, (int)getpid());
     WXNLoadConfig();
@@ -1653,6 +1544,7 @@ static void WXNInit(void) {
         WXNDumpReport();
     });
 
+    WXNInstallSceneProbe();
     WXNInstallTouch();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
