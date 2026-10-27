@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "1.9"
+#define WXN_VERSION     "2.0"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -57,6 +57,7 @@ typedef struct {
     BOOL sound;        // 播放提示音
     BOOL respectMute;  // 尊重微信的会话免打扰
     BOOL avatar;       // 用系统通讯通知显示发送者头像
+    BOOL nativeNotify; // 先让微信自己发（临时把它当成"在后台"），它不发我们再补
     BOOL debug;        // 打日志
 } WXNConfig;
 
@@ -65,6 +66,14 @@ static pthread_mutex_t gCfgLock = PTHREAD_MUTEX_INITIALIZER;
 
 // 上一次用户碰微信屏幕的时刻，用来判断「人是不是正在微信里」
 static double gLastTouch = 0;
+
+// 「假装在后台」：只在消息到达的那一小段时间里，让微信读到 Background，
+// 它就会走自己那条原生通知分支（标题/正文/角标/提示音/免打扰全是原生的）。
+static volatile BOOL gFakeBG = NO;
+static NSInteger gRealAppState = -1;   // 假装期间的真实状态
+static int gFakeBGGen = 0;
+static int gNativePosts = 0;  // 微信自己投递的通知条数
+static int gNativePostsAtStart = 0;
 
 
 static WXNConfig WXNConfigCopy(void) {
@@ -160,12 +169,13 @@ static void WXNLoadConfig(void) {
     c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
     c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : YES;
     c.avatar      = d[@"avatar"]      ? [d[@"avatar"] boolValue]      : NO;
+    c.nativeNotify = d[@"nativeNotify"] ? [d[@"nativeNotify"] boolValue] : YES;
     c.debug       = d[@"debug"]       ? [d[@"debug"] boolValue]       : YES;
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
-    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d debug=%d",
-            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.debug);
+    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d native=%d debug=%d",
+            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.nativeNotify, c.debug);
 }
 
 // ---------------------------------------------------------------------------
@@ -435,24 +445,29 @@ static BOOL WXNAppIsFrontmost(void) {
     return [b isEqualToString:@WXN_BUNDLE_ID];
 }
 
-static BOOL WXNShouldNotify(void) {
+// 人是不是已经离开微信了。
+// 沙盒里问不到"谁在最前"（SpringBoard 那条路返回 nil），退一步用"最近有没有碰屏幕"判断。
+static BOOL WXNAwayFromWeChat(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return NO;
 
     // 只有真的退到后台才交给微信自己（那时它的通知链路是正常的，再补一条会双弹）；
-    // Immortalizer 保活的 Active、锁屏过渡中的 Inactive，都归我们补。
-    if (app.applicationState == UIApplicationStateBackground) return NO;
+    // Immortalizer 保活的 Active、锁屏过渡中的 Inactive，都归我们处理。
+    // 注意：假装后台期间读到的 Background 是我们自己骗的，要用真实值。
+    NSInteger st = gFakeBG ? gRealAppState : (NSInteger)app.applicationState;
+    if (st == UIApplicationStateBackground) return NO;
 
-    // 人就在微信里就别弹
     if (WXNAppIsFrontmost()) return NO;
 
-    // 前台探测在沙盒里拿不到，退一步：十几秒内刚在微信里点过，就当人在微信里
     double idle = CFAbsoluteTimeGetCurrent() - gLastTouch;
-    if (gLastTouch > 0 && idle < 15) {
-        WXN_ALOG(@"  跳过：%.0f 秒前还在微信里操作", idle);
-        return NO;
-    }
+    if (gLastTouch > 0 && idle < 15) return NO;
 
+    return YES;
+}
+
+static BOOL WXNShouldNotify(void) {
+    if (!WXNAwayFromWeChat()) return NO;
+    if (gLastTouch > 0) WXN_ALOG(@"  人不在微信里（%.0f 秒没碰屏幕）", CFAbsoluteTimeGetCurrent() - gLastTouch);
     return YES;
 }
 
@@ -482,6 +497,9 @@ static BOOL WXNSeenBefore(NSString *key) {
 // ---------------------------------------------------------------------------
 
 static void WXNSetupPresentationHooks(void);
+static void WXNBeginFakeBackground(NSString *why);
+static void WXNEndFakeBackground(NSString *why);
+static BOOL WXNAwayFromWeChat(void);
 static void WXNDumpDelivered(NSString *tag);
 
 // 微信的富消息（表情/图片/链接）正文是 XML，直接当通知正文会很难看
@@ -695,6 +713,28 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
              }];
 }
 
+// 原生优先：先让微信自己发，它不发我们再补
+static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
+                       NSString *thread, NSString *senderUsr, BOOL isGroup) {
+    if (!gFakeBG) {
+        WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
+        return;
+    }
+    int base = gNativePostsAtStart;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        int now = gNativePosts;
+        if (now > base) {
+            WXN_ALOG(@"微信自己发了 %d 条通知，本次不再补发", now - base);
+            WXNEndFakeBackground(@"交给微信");
+            return;
+        }
+        WXNEndFakeBackground(@"微信没发，本插件兜底");
+        WXN_ALOG(@"微信没有自己发，改由本插件补发");
+        WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
+    });
+}
+
 // where 是命中的钩子名，日志里靠它判断到底是哪条链路把消息送上来的
 static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
     if (!wrap) {
@@ -808,7 +848,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
 
     body = WXNTrim(WXNCleanBody(body, type) ?: @"新消息", WXN_BODY_MAX);
 
-    WXNPost([@"wxn-" stringByAppendingString:key], title, subtitle, body, session, senderUsr, isGroup);
+    WXNDeliver([@"wxn-" stringByAppendingString:key], title, subtitle, body, session, senderUsr, isGroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +859,9 @@ static IMP gOrigForSessionNotify; // AsyncOnAddMsgForSession:MsgWrap:NewMsgArriv
 static NSMutableArray *gHookNames;  // 已挂上的消息钩子
 
 static void WXNForSessionNotify(id self, SEL _cmd, id session, id wrap, BOOL notify) {
+    if (WXNConfigCopy().enabled && notify && WXNAwayFromWeChat()) {
+        WXNBeginFakeBackground(@"AsyncOnAddMsgForSession");
+    }
     if (gOrigForSessionNotify) {
         ((void (*)(id, SEL, id, id, BOOL))gOrigForSessionNotify)(self, _cmd, session, wrap, notify);
     }
@@ -860,6 +903,9 @@ static void WXNMsgHook2(id self, SEL _cmd, id a1, id a2) {
     pthread_mutex_lock(&gOrigLock);
     orig = (IMP)[[gOrigMap objectForKey:name] pointerValue];
     pthread_mutex_unlock(&gOrigLock);
+    // 人不在微信里时先"假装后台"，让微信自己去发原生通知
+    if (WXNConfigCopy().enabled && WXNAwayFromWeChat()) WXNBeginFakeBackground(name);
+
     if (orig) ((void (*)(id, SEL, id, id))orig)(self, _cmd, a1, a2);
 
     @autoreleasepool {
@@ -1004,11 +1050,90 @@ static void WXNSetDelegate(id self, SEL _cmd, id delegate) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 「假装在后台」：让微信自己走原生那条通知链路
+//
+// Immortalizer 把 scene 按住不放，微信永远以为自己在前台，于是只走内部逻辑，
+// 从不发本地通知。我们没法真的把它送进后台（那等于放弃保活），但可以在消息
+// 到达的那一小段时间里，让 applicationState 读出来是 Background。
+// 只骗读接口，不触发任何真实生命周期回调，所以保活、长连接、界面都不受影响。
+// ---------------------------------------------------------------------------
+
+static NSInteger (*gOrigAppState)(id, SEL);
+
+static NSInteger WXNAppState(id self, SEL _cmd) {
+    if (gFakeBG) return UIApplicationStateBackground;
+    return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
+}
+
+static void (*gOrigPresentLocal)(id, SEL, id);
+static void (*gOrigScheduleLocal)(id, SEL, id);
+
+static void WXNPresentLocal(id self, SEL _cmd, id note) {
+    __sync_fetch_and_add(&gNativePosts, 1);
+    @try { WXN_ALOG(@"[微信自己投递·local] %@", note); } @catch (__unused NSException *e) {}
+    if (gOrigPresentLocal) gOrigPresentLocal(self, _cmd, note);
+}
+
+static void WXNScheduleLocal(id self, SEL _cmd, id note) {
+    __sync_fetch_and_add(&gNativePosts, 1);
+    @try { WXN_ALOG(@"[微信自己投递·local 定时] %@", note); } @catch (__unused NSException *e) {}
+    if (gOrigScheduleLocal) gOrigScheduleLocal(self, _cmd, note);
+}
+
+static void WXNInstallFakeBG(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class app = NSClassFromString(@"UIApplication");
+        if (!app) { WXN_ALOG(@"假装后台：找不到 UIApplication"); return; }
+        BOOL ok = WXNSwizzle(app, @"applicationState", (IMP)WXNAppState, &gOrigAppState);
+        WXNSwizzle(app, @"presentLocalNotificationNow:", (IMP)WXNPresentLocal, &gOrigPresentLocal);
+        WXNSwizzle(app, @"scheduleLocalNotification:", (IMP)WXNScheduleLocal, &gOrigScheduleLocal);
+        WXN_ALOG(@"假装后台：applicationState 接管%@", ok ? @"成功" : @"失败");
+    });
+}
+
+static void WXNEndFakeBackground(NSString *why) {
+    if (!gFakeBG) return;
+    gFakeBG = NO;
+    WXN_ALOG(@"假装后台结束（%@）", why);
+}
+
+// 在把消息交回微信之前调用：先骗它一会儿，看它会不会自己发通知
+static void WXNBeginFakeBackground(NSString *why) {
+    if (!WXNConfigCopy().nativeNotify) return;
+    if (gFakeBG) return;
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return;
+    WXNInstallFakeBG();
+
+    NSInteger real = gOrigAppState ? gOrigAppState(app, @selector(applicationState))
+                                   : UIApplicationStateActive;
+    if (real == UIApplicationStateBackground) return;
+
+    gRealAppState = real;
+    gNativePostsAtStart = gNativePosts;
+    gFakeBG = YES;
+    int gen = ++gFakeBGGen;
+    WXN_ALOG(@"假装后台：%@（真实 state=%ld）", why, (long)real);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       if (gen != gFakeBGGen || !gFakeBG) return;
+                       WXNEndFakeBackground(@"2 秒到点");
+                   });
+}
+
 static IMP gOrigAddRequest;
 
 // 把每一条投递都记下来：能分清是微信自己发的、还是本插件补的
 static void WXNAddRequest(id self, SEL _cmd, id req, id handler) {
     @try {
+        NSString *rid = [req valueForKey:@"identifier"];
+        if (rid && ![rid hasPrefix:@"wxn-"]) {
+            __sync_fetch_and_add(&gNativePosts, 1);
+            WXN_ALOG(@"[微信自己投递] id=%@ title=%@", rid, [req valueForKey:@"content"] ?
+                     [[req valueForKey:@"content"] valueForKey:@"title"] : @"");
+        }
         id content = [req valueForKey:@"content"];
         WXN_ALOG(@"[投递] id=%@ title=%@ sound=%@ badge=%@ body=%@",
                  [req valueForKey:@"identifier"],
