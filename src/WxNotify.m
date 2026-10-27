@@ -2064,8 +2064,6 @@ static void WXNFrontSetInterval(BOOL locked, BOOL fireSoon) {
                               iv, 200ull * NSEC_PER_MSEC);
 }
 
-static void WXNFrontTick(void);
-
 static void WXNFrontRun(void) {
     if (gFrontBusy) {
         if (++gFrontHangs > 4 && gFrontTimer) {
@@ -2132,7 +2130,6 @@ static void WXNFrontStart(void) {
     });
 }
 
-// 心跳：每 30 秒一行，看清「前台状态文件说的是谁」。
 __attribute__((constructor))
 static void WXNInit(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
