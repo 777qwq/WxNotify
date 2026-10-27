@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.9"
+#define WXN_VERSION     "2.10"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -984,6 +984,8 @@ static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle
 }
 
 // where 是命中的钩子名，日志里靠它判断到底是哪条链路把消息送上来的
+static void WXNBeginFakeBackground(NSString *why);   // 定义在后面
+
 static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
     if (!wrap) {
         WXN_ALOG(@"[%@] 参数里没有 CMessageWrap，跳过", where);
@@ -1018,9 +1020,8 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    // 人不在微信里：先拿走微信自己的“我在前台”认知，让它自己发
-    // （它整条原生链路一并跑：群名、免打扰、角标、声音都是它自己的）
-    WXNBeginFakeBackground(@"消息到达");
+    // 人不在微信里：真正要投递之前再翻它的认知（见 WXNBeginFakeBackground），
+    // 因为这里之后还可能因为“自己发的/免打扰/太旧/重复”而跳过
 
     // 自己发出去的消息不提醒
     Class wrapCls = NSClassFromString(@"CMessageWrap");
@@ -1121,6 +1122,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
 
     body = WXNTrim(WXNCleanBody(body, type) ?: @"新消息", WXN_BODY_MAX);
 
+    WXNBeginFakeBackground(@"消息到达");
     WXNDeliver([@"wxn-" stringByAppendingString:key], title, subtitle, body, session, senderUsr, isGroup);
 }
 
@@ -1195,6 +1197,24 @@ static void WXNNotifyToExt(id self, SEL _cmd, id a1) {
         WXN_ALOG(@"[MainThreadNotifyToExt] 命中，入参不是对象(%p)", a1);
     }
     if (gOrigNotifyToExt) ((void (*)(id, SEL, id))gOrigNotifyToExt)(self, _cmd, a1);
+}
+
+// 推送决策点：CMessageMgr 收到消息后会在这两个方法里决定「要不要弹提醒」。
+// 2.9 的日志里连这两个方法都没出现，说明它在更前面就认定「我在前台」了；
+// 2.10 把它们记下来，就能看出是“没走到”还是“走到了但被拦”。
+static BOOL WXNReadLNBG(void);   // 定义在后面，这里先声明
+
+static void WXNMsgHook2B(id self, SEL _cmd, id a1, BOOL flag) {
+    IMP orig = NULL;
+    NSString *name = NSStringFromSelector(_cmd);
+    pthread_mutex_lock(&gOrigLock);
+    orig = (IMP)[[gOrigMap objectForKey:name] pointerValue];
+    pthread_mutex_unlock(&gOrigLock);
+
+    WXN_ALOG(@"[%@] 微信在考虑发推送 always=%d 认知后台=%d 内容=%@", name, (int)flag,
+             (int)WXNReadLNBG(), WXNTrim([a1 description] ?: @"", 100));
+
+    if (orig) ((void (*)(id, SEL, id, BOOL))orig)(self, _cmd, a1, flag);
 }
 
 // 投递后把系统里当前存在的通知 id 抄一份，用来分清屏上的第二张横幅是谁的
@@ -1417,6 +1437,188 @@ static void WXNCognitionRestore(void) {
     WXNCognitionForce(NO);
 }
 
+// ---- 2.10：把微信各处的“我在前台”缓存一起翻 -------------------------------
+//
+// 2.9 只翻 MMLocalNotificationMgr 一个字段，而且连实例都没拿到：
+// onServiceInit 早就跑完了，钩子挂上时已经没人再调它。
+// 现在改成主动去 MMServiceCenter 里把它提出来，同时把另外两处也一并翻：
+//   MicroMessengerAppDelegate -isForeground
+//   AppMonitorImpl            -IsAppInBackground
+// 全部是可逆的取值钩子，只在“假装后台”的 2.5 秒内生效。
+static BOOL (*gOrigIsForeground)(id, SEL);
+static BOOL (*gOrigAppMonitorBG)(id, SEL);
+static id (*gOrigGetService)(id, SEL, Class);
+static double gLastStateDump = 0;
+
+static BOOL WXNStateName(const char *n) {
+    if (!n) return NO;
+    NSString *low = [[NSString stringWithUTF8String:n] ?: @"" lowercaseString];
+    return [low containsString:@"active"] || [low containsString:@"background"] ||
+           [low containsString:@"foreground"] || [low containsString:@"inback"];
+}
+
+// 把对象上所有“状态类”的布尔字段读一遍，看微信到底认为自己在哪
+static void WXNDumpState(id obj, NSString *tag) {
+    if (!obj) return;
+    Class c = object_getClass(obj);
+    NSMutableArray *out = [NSMutableArray array];
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(c, &n);
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        if (!WXNStateName(nm)) continue;
+        const char *tp = ivar_getTypeEncoding(ivars[i]);
+        if (!tp || (tp[0] != 'c' && tp[0] != 'B')) {
+            [out addObject:[NSString stringWithFormat:@"%s(非布尔)", nm]];
+            continue;
+        }
+        BOOL v = *(BOOL *)((char *)(__bridge void *)obj + ivar_getOffset(ivars[i]));
+        [out addObject:[NSString stringWithFormat:@"%s=%d", nm, (int)v]];
+    }
+    if (ivars) free(ivars);
+    WXN_ALOG(@"%@ 的状态字段：%@", tag, out.count ? [out componentsJoinedByString:@" "] : @"(没有)");
+}
+
+// 字段名对不上的时候，得能看到真实存在哪些名字
+static void WXNDumpIvars(Class c) {
+    if (!c) return;
+    NSMutableArray *out = [NSMutableArray array];
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(c, &n);
+    for (unsigned int i = 0; i < n; i++) {
+        [out addObject:[NSString stringWithFormat:@"%s(%s)",
+                        ivar_getName(ivars[i]) ?: "?",
+                        ivar_getTypeEncoding(ivars[i]) ?: "?"]];
+    }
+    if (ivars) free(ivars);
+    WXN_ALOG(@"%@ 的字段(%u 个)：%@", NSStringFromClass(c), n,
+             [out componentsJoinedByString:@" "] ?: @"(空)");
+}
+
+static id WXNServiceCenter(void) {
+    Class msc = NSClassFromString(@"MMServiceCenter");
+    if (!msc) return nil;
+    for (NSString *n in @[ @"defaultCenter", @"sharedInstance", @"sharedCenter",
+                           @"defaultServiceCenter", @"GlobalInstance" ]) {
+        SEL s = NSSelectorFromString(n);
+        if (![msc respondsToSelector:s]) continue;
+        id v = nil;
+        @try { v = ((id (*)(id, SEL))objc_msgSend)((id)msc, s); }
+        @catch (__unused NSException *e) { v = nil; }
+        if (v) {
+            WXN_ALOG(@"MMServiceCenter 用 +%@ 取到了", n);
+            return v;
+        }
+    }
+    // 没有现成入口时，把它的类方法列出来，下一版直接按名字调
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(object_getClass(msc), &n);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) [names addObject:NSStringFromSelector(method_getName(ms[i]))];
+    if (ms) free(ms);
+    WXN_ALOG(@"MMServiceCenter 没有单例入口，类方法有：%@", [names componentsJoinedByString:@" "]);
+    return nil;
+}
+
+static void WXNTryGrabLN(NSString *why) {
+    if (gLN) return;
+    Class ln = NSClassFromString(@"MMLocalNotificationMgr");
+    if (!ln) {
+        WXN_ALOG(@"没有 MMLocalNotificationMgr 这个类");
+        return;
+    }
+    id center = WXNServiceCenter();
+    if (!center) return;
+    SEL g = NSSelectorFromString(@"getService:");
+    if (![center respondsToSelector:g]) {
+        WXN_ALOG(@"MMServiceCenter 没有 getService:");
+        return;
+    }
+    id svc = nil;
+    @try { svc = ((id (*)(id, SEL, Class))objc_msgSend)(center, g, ln); }
+    @catch (__unused NSException *e) { svc = nil; }
+    if (svc) {
+        WXN_ALOG(@"%@@ 时从服务里提到了 MMLocalNotificationMgr", why);
+        WXNGrabLN(svc);
+    } else {
+        WXN_ALOG(@"%@@ 时服务里还没有 MMLocalNotificationMgr", why);
+    }
+}
+
+// 微信向服务容器要东西的时候顺手看一眼，正好给它时就抓住
+static id WXNGetServiceHook(id self, SEL _cmd, Class cls) {
+    id svc = gOrigGetService ? gOrigGetService(self, _cmd, cls) : nil;
+    if (svc && cls == NSClassFromString(@"MMLocalNotificationMgr")) WXNGrabLN(svc);
+    return svc;
+}
+
+// 只在“假装后台”的窗口内生效，窗口一关立刻回真实值
+static BOOL WXNIsForegroundHook(id self, SEL _cmd) {
+    if (gFakeBG) {
+        if (CFAbsoluteTimeGetCurrent() - gLastStateDump > 1.0) {
+            gLastStateDump = CFAbsoluteTimeGetCurrent();
+            WXN_ALOG(@"  [假装后台] -isForeground 被问了，回答 NO");
+        }
+        return NO;
+    }
+    return gOrigIsForeground ? gOrigIsForeground(self, _cmd) : YES;
+}
+
+static BOOL WXNAppMonitorBGHook(id self, SEL _cmd) {
+    if (gFakeBG) return YES;
+    return gOrigAppMonitorBG ? gOrigAppMonitorBG(self, _cmd) : NO;
+}
+
+static void WXNInstallCognitionHooks(void) {
+    Class app = NSClassFromString(@"MicroMessengerAppDelegate");
+    if (app) {
+        WXNSwizzle(app, @"isForeground", (IMP)WXNIsForegroundHook, &gOrigIsForeground);
+    } else {
+        WXN_ALOG(@"没有 MicroMessengerAppDelegate");
+    }
+
+    Class mon = NSClassFromString(@"AppMonitorImpl");
+    if (mon) {
+        WXNSwizzle(mon, @"IsAppInBackground", (IMP)WXNAppMonitorBGHook, &gOrigAppMonitorBG);
+    } else {
+        WXN_ALOG(@"没有 AppMonitorImpl");
+    }
+
+    // 以后微信再要这个服务时能抓到
+    Class msc = NSClassFromString(@"MMServiceCenter");
+    if (msc) WXNSwizzle(msc, @"getService:", (IMP)WXNGetServiceHook, &gOrigGetService);
+
+    Class ln = NSClassFromString(@"MMLocalNotificationMgr");
+    if (ln) WXNDumpIvars(ln);
+    if (app) WXNDumpIvars(app);
+
+    // 微信的版本号很关键：字段名对不上时得知道是哪个版本
+    WXN_ALOG(@"微信版本=%@", [[NSBundle mainBundle] infoDictionary][@"CFBundleShortVersionString"] ?: @"(取不到)");
+}
+
+// 取实例 / 读状态：只能在 App 真的起来之后调，构造器里会太早
+static void WXNDumpCognition(void) {
+    WXNTryGrabLN(@"诊断");
+    if (gLN) {
+        WXNDumpState(gLN, @"MMLocalNotificationMgr");
+        WXN_ALOG(@"微信自己的认知：后台=%d（1=它认为自己在后台）", (int)WXNReadLNBG());
+    }
+    Class app = NSClassFromString(@"MicroMessengerAppDelegate");
+    if (app && [app respondsToSelector:NSSelectorFromString(@"GlobalInstance")]) {
+        id inst = ((id (*)(id, SEL))objc_msgSend)((id)app, NSSelectorFromString(@"GlobalInstance"));
+        if (inst) {
+            WXNDumpState(inst, @"MicroMessengerAppDelegate");
+            SEL fg = NSSelectorFromString(@"isForeground");
+            if ([inst respondsToSelector:fg]) {
+                BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)(inst, fg);
+                WXN_ALOG(@"-isForeground 回答：%d", (int)v);
+            }
+        }
+    }
+    Class mon = NSClassFromString(@"AppMonitorImpl");
+    if (mon) WXN_ALOG(@"AppMonitorImpl %@", mon ? @"在" : @"不在");
+}
+
 static void WXNLNInit(id self, SEL _cmd) {
     WXNGrabLN(self);
     WXN_ALOG(@"微信服务启动：MMLocalNotificationMgr（当前认知 后台=%d）", (int)WXNReadLNBG());
@@ -1439,6 +1641,7 @@ static void WXNLNEnterFG(id self, SEL _cmd) {
 
 static void WXNLNShowPush(id self, SEL _cmd, id arg1, BOOL always) {
     WXNGrabLN(self);
+    if (gFakeBG) WXNCognitionForce(YES);   // 已经走到这一步了，把认知坐实
     WXN_ALOG(@"微信在考虑发推送：OnShowPush always=%d 认知后台=%d 内容=%@",
              (int)always, (int)WXNReadLNBG(), WXNTrim([arg1 description] ?: @"", 120));
     if (gOrigLNShowPush) gOrigLNShowPush(self, _cmd, arg1, always);
@@ -1446,6 +1649,7 @@ static void WXNLNShowPush(id self, SEL _cmd, id arg1, BOOL always) {
 
 static void WXNLNShowPush2(id self, SEL _cmd, id wrap, id fireDate, BOOL voip) {
     WXNGrabLN(self);
+    if (gFakeBG) WXNCognitionForce(YES);
     WXN_ALOG(@"微信要发本地推送（短参数）voip=%d 认知后台=%d wrap=%@",
              (int)voip, (int)WXNReadLNBG(), WXNTrim([wrap description] ?: @"", 120));
     if (gOrigLNShowPush2) gOrigLNShowPush2(self, _cmd, wrap, fireDate, voip);
@@ -1454,6 +1658,7 @@ static void WXNLNShowPush2(id self, SEL _cmd, id wrap, id fireDate, BOOL voip) {
 static void WXNLNShowPush3(id self, SEL _cmd, id wrap, id ident, id fireDate,
                            BOOL voip, BOOL silent) {
     WXNGrabLN(self);
+    if (gFakeBG) WXNCognitionForce(YES);
     WXN_ALOG(@"微信要发本地推送（全参数）voip=%d silent=%d 认知后台=%d id=%@",
              (int)voip, (int)silent, (int)WXNReadLNBG(), ident);
     if (gOrigLNShowPush3) gOrigLNShowPush3(self, _cmd, wrap, ident, fireDate, voip, silent);
@@ -1492,25 +1697,27 @@ static void WXNBeginFakeBackground(NSString *why) {
 
     gNativePostsAtStart = gNativePosts;
 
-    if (WXNConfigCopy().nativeNotify) {
-        // 老方案（实测微信不看它，留着做对照）
-        UIApplication *app = [UIApplication sharedApplication];
-        if (!app) return;
+    // 2.10：不再二选一。applicationState、isForeground、IsAppInBackground、
+    // m_isInBackground 四处一起翻，窗口只有 2.5 秒，结束后全部回真实值。
+    UIApplication *app = [UIApplication sharedApplication];
+    if (app) {
         WXNInstallFakeBG();
         NSInteger real = gOrigAppState ? gOrigAppState(app, @selector(applicationState))
                                        : UIApplicationStateActive;
-        if (real == UIApplicationStateBackground) return;
-        gRealAppState = real;
-        WXN_ALOG(@"假装后台：%@（真实 state=%ld）", why, (long)real);
-    } else {
-        // 新方案：直接改微信自己的那个标志
-        if (!gLN || !gLNIsBG) {
-            WXN_ALOG(@"认知实验：还没拿到 MMLocalNotificationMgr，本次不试");
+        if (real == UIApplicationStateBackground) {
+            WXN_ALOG(@"微信真的在后台，交给它自己（%@）", why);
             return;
         }
-        WXN_ALOG(@"认知实验：%@（改前 后台=%d）", why, (int)WXNReadLNBG());
-        WXNCognitionForce(YES);
+        gRealAppState = real;
+    } else {
+        gRealAppState = UIApplicationStateActive;
     }
+
+    WXNTryGrabLN(why);
+    WXN_ALOG(@"认知实验：%@（LN=%@ 改前 后台=%d）", why, gLN ? @"拿到" : @"没拿到",
+             (int)WXNReadLNBG());
+    WXNCognitionForce(YES);
+    if (gLNIsBG) WXNDumpState(gLN, @"翻之后 MMLocalNotificationMgr");
 
     gFakeBG = YES;
     int gen = ++gFakeBGGen;
@@ -1629,6 +1836,32 @@ static BOOL WXNInstall(void) {
     } else if (extSig) {
         WXN_ALOG(@"MainThreadNotifyToExt: 入参不是对象，不挂");
     }
+
+    // 推送决策点（2.10 新增）
+    for (NSString *name in @[ @"AsyncOnPushMsg:isAlwaysShow:", @"onNewSyncShowPush:isAlwaysShow:" ]) {
+        SEL sel = NSSelectorFromString(name);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            WXN_ALOG(@"没有 %@，跳过", name);
+            continue;
+        }
+        NSMethodSignature *sig = [cls instanceMethodSignatureForSelector:sel];
+        const char *t3 = (sig && sig.numberOfArguments > 3) ? [sig getArgumentTypeAtIndex:3] : "?";
+        if (!sig || sig.numberOfArguments != 4 ||
+            strcmp([sig getArgumentTypeAtIndex:2], "@") != 0 ||
+            (t3[0] != 'c' && t3[0] != 'B')) {
+            WXN_ALOG(@"%@ 的参数对不上，跳过", name);
+            continue;
+        }
+        IMP orig = method_getImplementation(m);
+        if (orig != (IMP)WXNMsgHook2B) {
+            gOrigMap[name] = [NSValue valueWithPointer:orig];
+            method_setImplementation(m, (IMP)WXNMsgHook2B);
+            WXN_ALOG(@"已挂 %@", name);
+        }
+        if (![gHookNames containsObject:name]) [gHookNames addObject:name];
+        any = YES;
+    }
     return any;
 }
 
@@ -1740,6 +1973,7 @@ static void WXNDumpReport(void) {
              NSClassFromString(@"CMessageMgr") ? @"在" : @"不在",
              NSClassFromString(@"CMessageWrap") ? @"在" : @"不在",
              NSClassFromString(@"CContactMgr") ? @"在" : @"不在");
+    WXNDumpCognition();
     WXN_ALOG(@"消息钩子(%lu 个)：%@", (unsigned long)gHookNames.count,
              [gHookNames componentsJoinedByString:@" / "] ?: @"(一个也没挂上)");
     WXN_ALOG(@"呈现钩子：willPresent=%@ 截获投递=%@ 当前 delegate=%@",
@@ -2000,6 +2234,7 @@ static void WXNInit(void) {
     WXNInstallSceneProbe();
     WXNInstallAppNotices();
     WXNInstallLocalNotificationProbe();
+    WXNInstallCognitionHooks();
     WXNInstallTouch();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
@@ -2016,6 +2251,8 @@ static void WXNInit(void) {
                    dispatch_get_main_queue(), ^{
                        WXNInstallSceneProbe();   // 被别人又盖回去的，重新接管一次
                        WXNInstallFrameProbe();   // 这时 App 已经起来了，建探针才安全
+                       WXNInstallCognitionHooks();
+                       WXNDumpCognition();
                        WXNSetupPresentationHooks();
                        WXNDumpReport();
                        WXNPostBootOnce();
@@ -2024,6 +2261,8 @@ static void WXNInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNInstallSceneProbe();
+                       WXNTryGrabLN(@"启动 20 秒");
+                       WXNDumpCognition();
                        WXNSetupPresentationHooks();
                        WXNDumpReport();
                    });
