@@ -111,8 +111,10 @@ notifyutil -p cn.qwq.wxnotify.test   # 投一条测试通知
 | --- | --- | --- |
 | `enabled` | `true` | 总开关 |
 | `showContent` | `true` | 横幅显示正文；关掉只显示「你收到一条新消息」 |
-| `sound` | `true` | 提示音 |
-| `respectMute` | `false` | 是否尊重会话免打扰。默认关：这个判断依赖私有选择器，各版本语义没把握，宁可多弹也不漏 |
+| `sound` | `true` | 提示音（优先用微信包里那条原生提示音，找不到才用系统默认） |
+| `respectMute` | `true` | 是否尊重会话免打扰。命中 `isChatStatusNotifyOpenForMsgWrap:` 为关就不提醒 |
+| `nativeNotify` | `true` | 原生优先：消息到达时先把 `applicationState` 读成 `Background`（只骗读接口，不动真实生命周期），让微信自己走它那条通知链路；1.2 秒内它没投递才由本插件兜底 |
+| `avatar` | `false` | 用系统通讯通知显示发送者。没有 `INImage` 时 iOS 会自己加一条「你与 <wxid>」副标题，所以默认关 |
 | `debug` | `true` | 打日志 |
 
 自检：`notifyutil -p cn.qwq.wxnotify.test` 投一条测试通知，能看到横幅就说明两半都通了。
