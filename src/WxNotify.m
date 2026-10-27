@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "1.6"
+#define WXN_VERSION     "1.7"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -56,15 +56,12 @@ typedef struct {
     BOOL showContent;  // 显示消息正文；关掉就只显示"你收到一条新消息"
     BOOL sound;        // 播放提示音
     BOOL respectMute;  // 尊重微信的会话免打扰（默认关，宁可多弹也不要漏）
-    BOOL muteTone;     // 禁掉微信自己那一声提示音，避免跟我们重复响
     BOOL debug;        // 打日志
 } WXNConfig;
 
 static WXNConfig gCfg;
 static pthread_mutex_t gCfgLock = PTHREAD_MUTEX_INITIALIZER;
 
-// 微信自带提示音的静音窗口（补发了通知就不让它再响一声）
-static double gMuteToneUntil = 0;
 
 static WXNConfig WXNConfigCopy(void) {
     WXNConfig c;
@@ -155,15 +152,15 @@ static void WXNLoadConfig(void) {
     WXNConfig c;
     c.enabled     = d[@"enabled"]     ? [d[@"enabled"] boolValue]     : YES;
     c.showContent = d[@"showContent"] ? [d[@"showContent"] boolValue] : YES;
-    c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
+    // 默认静音：提示音交给微信自己那一声，避免一声消息两声提示
+    c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : NO;
     c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : NO;
-    c.muteTone    = d[@"muteTone"]    ? [d[@"muteTone"] boolValue]    : YES;
     c.debug       = d[@"debug"]       ? [d[@"debug"] boolValue]       : YES;
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
-    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d muteTone=%d debug=%d",
-            c.enabled, c.showContent, c.sound, c.respectMute, c.muteTone, c.debug);
+    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d debug=%d",
+            c.enabled, c.showContent, c.sound, c.respectMute, c.debug);
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +611,6 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
 
     body = WXNTrim(WXNCleanBody(body, type) ?: @"新消息", WXN_BODY_MAX);
 
-    if (cfg.muteTone) gMuteToneUntil = CFAbsoluteTimeGetCurrent() + 3.0;
     WXNPost([@"wxn-" stringByAppendingString:key], title, body, session);
 }
 
@@ -1008,77 +1004,6 @@ static void WXNDumpReport(void) {
     WXN_ALOG(@"======== 诊断结束 ========");
 }
 
-// ---------------------------------------------------------------------------
-// 微信自己也会播一声「新消息提示音」，跟我们补发的通知撞在一起就是一声消息两声提示。
-// 补发窗口内（3 秒）把微信自己播的短提示音吞掉，震动保留。
-// ---------------------------------------------------------------------------
-
-static BOOL WXNInToneWindow(void) {
-    return gMuteToneUntil > 0 && CFAbsoluteTimeGetCurrent() < gMuteToneUntil;
-}
-
-typedef unsigned int WXNSoundID;
-typedef void (*WXNPlaySoundFn)(WXNSoundID);
-
-static WXNPlaySoundFn gOrigPlaySystemSound;
-static WXNPlaySoundFn gOrigPlayAlertSound;
-
-static void WXNPlaySound(WXNSoundID sid, WXNPlaySoundFn orig) {
-    if (sid == 4095) { // kSystemSoundID_Vibrate：震动留着
-        if (orig) orig(sid);
-        return;
-    }
-    if (WXNInToneWindow()) {
-        WXN_ALOG(@"吞掉微信自带提示音 snd=%u", (unsigned)sid);
-        return;
-    }
-    if (orig) orig(sid);
-}
-
-static void WXNPlaySystemSound(WXNSoundID sid) { WXNPlaySound(sid, gOrigPlaySystemSound); }
-static void WXNPlayAlertSound(WXNSoundID sid) { WXNPlaySound(sid, gOrigPlayAlertSound); }
-
-static IMP gOrigPlayerPlay;
-
-static BOOL WXNPlayerPlay(id self, SEL _cmd) {
-    double duration = 0;
-    @try {
-        NSNumber *n = [self valueForKey:@"duration"];
-        if ([n isKindOfClass:[NSNumber class]]) duration = [n doubleValue];
-    } @catch (__unused NSException *e) {
-    }
-    if (WXNInToneWindow() && duration > 0 && duration < 5) {
-        WXN_ALOG(@"吞掉微信自带提示音 AVAudioPlayer duration=%.2f", duration);
-        return YES;
-    }
-    return gOrigPlayerPlay ? ((BOOL (*)(id, SEL))gOrigPlayerPlay)(self, _cmd) : NO;
-}
-
-static void WXNInstallToneMute(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        if (!WXNConfigCopy().muteTone) {
-            WXN_ALOG(@"muteTone=0，微信自带提示音照旧");
-            return;
-        }
-        typedef void (*WXNHookFn)(void *, void *, void **);
-        WXNHookFn hookFn = NULL;
-        void *h = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
-        if (h) hookFn = (WXNHookFn)dlsym(h, "MSHookFunction");
-        if (!hookFn) hookFn = (WXNHookFn)dlsym(RTLD_DEFAULT, "MSHookFunction");
-
-        void *p1 = dlsym(RTLD_DEFAULT, "AudioServicesPlaySystemSound");
-        void *p2 = dlsym(RTLD_DEFAULT, "AudioServicesPlayAlertSound");
-        if (hookFn && p1) hookFn(p1, (void *)WXNPlaySystemSound, (void **)&gOrigPlaySystemSound);
-        if (hookFn && p2) hookFn(p2, (void *)WXNPlayAlertSound, (void **)&gOrigPlayAlertSound);
-        WXN_ALOG(@"提示音拦截：MSHookFunction=%s SystemSound=%s AlertSound=%s",
-                 hookFn ? "有" : "无", p1 ? "有" : "无", p2 ? "有" : "无");
-
-        Class pc = NSClassFromString(@"AVAudioPlayer");
-        if (pc) WXNSwizzle(pc, @"play", (IMP)WXNPlayerPlay, &gOrigPlayerPlay);
-    });
-}
-
 static void WXNPostBootOnce(void) {
     NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     if (!docs.count) return;
@@ -1115,7 +1040,6 @@ __attribute__((constructor))
 static void WXNInit(void) {
     WXN_ALOG(@"======== WxNotify %s 已加载 pid=%d ========", WXN_VERSION, (int)getpid());
     WXNLoadConfig();
-    WXNInstallToneMute();
 
     static int changedToken = -1;
     notify_register_dispatch(WXN_CHANGED_NOT, &changedToken, dispatch_get_main_queue(), ^(int t) {
