@@ -40,11 +40,13 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.11"
+#define WXN_VERSION     "2.12"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
 #define WXN_DIAG_NOT    "cn.qwq.wxnotify.diag"
+// 2.12：SpringBoard 侧守卫写的真·最前台状态
+#define WXN_FRONT_PATH  "/var/mobile/Library/Preferences/cn.qwq.wxnotify.front"
 #define WXN_DEACT_NOT   "cn.qwq.wxnotify.deact"      // 场景被停用时广播一下（调试用）
 
 // 通知里显示的内容上限，防止超长消息把横幅撑爆
@@ -66,22 +68,6 @@ typedef struct {
 
 static WXNConfig gCfg;
 static pthread_mutex_t gCfgLock = PTHREAD_MUTEX_INITIALIZER;
-
-// 上一次用户碰微信屏幕的时刻，用来判断「人是不是正在微信里」
-static double gLastTouch = 0;
-
-// 屏幕刷新探针：只要微信真的显示在屏幕上，CADisplayLink 就会一直回调。
-// 被别的 App 盖住时，即使 scene 被 Immortalizer 假装成前台，画面也不会被合成，
-// 回调就会停。这是“人到底看不看得见微信”唯一不靠猜的线索。
-static volatile double gLastFrameAt = 0;
-static volatile long gFrameTicks = 0;
-static id gFrameLink = nil;
-
-// 冻结检测：CLOCK_REALTIME 与 CLOCK_MONOTONIC 的差值就是“进程停摆了多久”
-static double gLastBeatReal = 0;
-static double gLastBeatMono = 0;
-static volatile double gLastFreezeAt = 0;
-static volatile double gLastFreezeLen = 0;
 
 // 微信 scene 的"被停用"信号：真的切去别的 App、上滑回桌面时才会出现。
 // 沙盒里问不到最前台是谁（SBS 那条路返回 nil），这条是唯一不靠猜的线索。
@@ -494,27 +480,41 @@ static BOOL WXNDeviceLocked(void) {
     return v != 0;
 }
 
-// 人是不是就在微信里。
+// 人在不在微信里 —— 2.12 起只信 SpringBoard 写的那份状态。
 //
-// 2.5 的实测结论：Immortalizer 把 scene 停用信号和所有退到后台的广播都抹了，
-// 进程里根本看不到“用户走了”。所以改成看两件它拓不掉的事实：
-//   1) 屏幕还在不在刷新（CADisplayLink）——不在刷就是被人盖住了
-//   2) 进程有没有停摆过（realtime 与 monotonic 的差）——停过就是当时不在前台
-// 两个探针都不可用时，才退回“最近 20 秒内碰过屏幕”。
-static BOOL WXNFrameAlive(void) {
-    if (gFrameTicks == 0) return NO;
-    return (CFAbsoluteTimeGetCurrent() - gLastFrameAt) < 3.0;
+// 帧探针和触摸两版都失败了：帧探针在 Immortalizer 下永远在刷（锁屏时也刷），
+// 触摸只在微信里才有，“人在别的 App”和“人在微信里发呆”对进程来说一模一样。
+// 进程内再也搾不出更可靠的信号，所以换路线：让 SpringBoard 自己来说。
+// 它不受沙盒限制，也骗不到（Immortalizer 骗的是 App 自己），
+// 同一个 dylib 注入 com.apple.springboard 后每半秒把真实的 frontmost 写进这个文件：
+//     bundle|时间戳|锁屏|熄屏|用的哪个接口
+static NSString *WXNFrontLine(void) {
+    NSString *s = [NSString stringWithContentsOfFile:@WXN_FRONT_PATH
+                                            encoding:NSUTF8StringEncoding
+                                               error:NULL];
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
 }
 
-// 2.11：画面探针在 Immortalizer 下永远在刷（进程根本不会被挂起，锁屏了还在刷 ——
-// 16:56:56 锁屏时报“0.4 秒前刷过”就是证据），拿它判断只能一直判成“在微信里”。
-// 改成只看手指：8 秒内摸过屏幕 = 人就在微信里；锁屏 / 久没摸 = 人不在。
-static BOOL WXNUserInWeChat(void) {
-    double now = CFAbsoluteTimeGetCurrent();
-
-    if (WXNDeviceLocked()) return NO;          // 锁屏了，肯定不在微信里
-    if (gLastTouch <= 0) return NO;            // 从没接到过触摸，当成不在
-    return (now - gLastTouch) < 8.0;
+static BOOL WXNInWeChat(NSString **whyOut) {
+    NSString *line = WXNFrontLine();
+    if (!line.length) {
+        if (whyOut) *whyOut = @"SpringBoard 状态文件读不到（装完没注销？或者守卫没注进去）";
+        return NO;
+    }
+    NSArray *f = [line componentsSeparatedByString:@"|"];
+    if (f.count < 2) {
+        if (whyOut) *whyOut = [@"状态文件格式不对：" stringByAppendingString:WXNTrim(line, 60)];
+        return NO;
+    }
+    double age = [[NSDate date] timeIntervalSince1970] - [f[1] doubleValue];
+    BOOL locked = (f.count > 2) && [f[2] boolValue];
+    if (whyOut) {
+        *whyOut = [NSString stringWithFormat:@"最前台=%@（%.1f 秒前写的，锁屏=%d，接口=%@）",
+                   f[0], age, (int)locked, f.count > 4 ? f[4] : @"?"];
+    }
+    if (age > 5.0) return NO;    // 守卫挂了：宁可多弹，不要漏
+    if (locked) return NO;
+    return [f[0] isEqualToString:@WXN_BUNDLE_ID];
 }
 
 static BOOL WXNShouldNotify(void) {
@@ -525,23 +525,16 @@ static BOOL WXNShouldNotify(void) {
     NSInteger st = gFakeBG ? gRealAppState : (NSInteger)app.applicationState;
     if (st == UIApplicationStateBackground) return NO;
 
-    // 锁屏了：肯定要提醒，这时候触摸记录没有意义
+    // 锁屏了：肯定要提醒
     if (WXNDeviceLocked()) {
         WXN_ALOG(@"  锁屏中，要提醒");
         return YES;
     }
 
-    if (WXNUserInWeChat()) {
-        WXN_ALOG(@"  跳过：人就在微信里（画面 %.0f 秒前刷过，触摸 %.0f 秒前）",
-                 gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1,
-                 gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1);
-        return NO;
-    }
-    WXN_ALOG(@"  人不在微信里（画面 %.0f 秒前刷过，触摸 %.0f 秒前，冻结 %.0f 秒前）",
-             gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1,
-             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
-             gLastFreezeAt > 0 ? CFAbsoluteTimeGetCurrent() - gLastFreezeAt : -1);
-    return YES;
+    NSString *why = nil;
+    BOOL inWeChat = WXNInWeChat(&why);
+    WXN_ALOG(@"  前台判断：%@ -> %@", why ?: @"(无)", inWeChat ? @"人在微信里" : @"人不在微信里");
+    return !inWeChat;
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,10 +1002,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
 
     // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
     if (!WXNShouldNotify()) {
-        WXN_ALOG(@"  跳过：人就在微信里（触摸 %.0f 秒前）state=%ld frontmost=%@",
-                 gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
-                 (long)[UIApplication sharedApplication].applicationState,
-                 WXNCurrentFrontmostBundle() ?: @"(未知)");
+        WXN_ALOG(@"  跳过：前台判断为“人在微信里”");
         return;
     }
 
@@ -1262,17 +1252,15 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
                            void (^completion)(NSUInteger)) {
     double now = CFAbsoluteTimeGetCurrent();
     BOOL faked = (now < gFakeUntil);
-    BOOL inWeChat = !gForceNextBanner && !faked && WXNUserInWeChat();
+    NSString *why = nil;
+    BOOL inWeChat = !gForceNextBanner && !faked && WXNInWeChat(&why);
 
     // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
     // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
     // 人不在微信里（或这条是我们刚翻出来的）-> 给足横幅+声音+角标。
-    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 刚翻的=%d 强制=%d 触摸=%.1f秒前 锁屏=%d 画面=%.1f秒前刷过",
+    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 刚翻的=%d 强制=%d（%@）",
              NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)faked,
-             (int)gForceNextBanner,
-             gLastTouch > 0 ? now - gLastTouch : -1,
-             (int)WXNDeviceLocked(),
-             gFrameTicks > 0 ? now - gLastFrameAt : -1);
+             (int)gForceNextBanner, why ?: @"(无)");
 
     if (inWeChat) {
         WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
@@ -1871,10 +1859,8 @@ static BOOL WXNInstall(void) {
     return any;
 }
 
-// 微信在前台时不要弹系统横幅：沙盒里查不到「谁在最前」，
-// 换个办法——记下「人刚才有没有碰过屏幕」，十几秒内碰过就当人在微信里。
-static void (*gOrigSendEvent)(id, SEL, UIEvent *);
-
+// 角标钩子：微信自己清角标时，我们记的未读数也跟着清。
+// 2.12 起不再挂 sendEvent:（触摸判断废弃），“回到微信”由前台状态文件判定。
 static void (*gOrigSetBadge)(id, SEL, NSInteger);
 
 static void WXNSetBadge(id self, SEL _cmd, NSInteger n) {
@@ -1882,27 +1868,34 @@ static void WXNSetBadge(id self, SEL _cmd, NSInteger n) {
     if (gOrigSetBadge) gOrigSetBadge(self, _cmd, n);
 }
 
-static void WXNSendEvent(id self, SEL _cmd, UIEvent *event) {
-    @try {
-        if ([event isKindOfClass:NSClassFromString(@"UITouchesEvent")]) {
-            gLastTouch = CFAbsoluteTimeGetCurrent();
-            // 人在微信里动手了，就当未读已经看过了：角标归零，图标上的数字也跟着清
-            if (gBadge > 0) {
-                WXNBadgeReset(@"回到微信");
-                if (gOrigSetBadge) gOrigSetBadge(self, @selector(setApplicationIconBadgeNumber:), 0);
-            }
-        }
-    } @catch (...) {}
-    if (gOrigSendEvent) gOrigSendEvent(self, _cmd, event);
+static void WXNInstallBadge(void) {
+    Class cls = NSClassFromString(@"UIApplication");
+    if (!cls) { WXN_ALOG(@"角标钩子：找不到 UIApplication"); return; }
+    WXNSwizzle(cls, @"setApplicationIconBadgeNumber:", (IMP)WXNSetBadge, &gOrigSetBadge);
+    WXN_ALOG(@"角标钩子：%@", gOrigSetBadge ? @"已挂" : @"没挂上");
 }
 
-static void WXNInstallTouch(void) {
-    Class cls = NSClassFromString(@"UIApplication");
-    if (!cls) { WXN_ALOG(@"屏幕触摸钩子：找不到 UIApplication"); return; }
-    BOOL ok = WXNSwizzle(cls, @"sendEvent:", (IMP)WXNSendEvent, &gOrigSendEvent);
-    WXNSwizzle(cls, @"setApplicationIconBadgeNumber:", (IMP)WXNSetBadge, &gOrigSetBadge);
-    WXN_ALOG(@"屏幕触摸钩子：%@；角标钩子：%@", ok ? @"已挂" : @"没挂上",
-             gOrigSetBadge ? @"已挂" : @"没挂上");
+// 2.12：跟着 SpringBoard 的状态文件走。手指不再参与判断，
+// 但“人回到微信”这件事还得知道——用来清角标、写一条“回来了”的日志。
+static BOOL gWasInWeChat = NO;
+
+static void WXNWatchFront(void) {
+    @try {
+        NSString *why = nil;
+        BOOL in = WXNInWeChat(&why);
+        if (in != gWasInWeChat) {
+            gWasInWeChat = in;
+            WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
+        }
+        if (in && gBadge > 0) {
+            WXNBadgeReset(@"回到微信");
+            [UIApplication sharedApplication].applicationIconBadgeNumber = 0;
+        }
+    } @catch (__unused NSException *e) {}
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXNWatchFront();
+                   });
 }
 
 // 类可能比 dylib 的 constructor 晚就绪，最多重试 20 次（约 10 秒）
@@ -1955,11 +1948,9 @@ static void WXNDumpReport(void) {
     WXN_ALOG(@"场景信号：known=%d away=%d reasons=0x%llx（0=能看到 1=被 Immortalizer 全抹了）",
              (int)gSceneKnown, (int)gSceneAway, (unsigned long long)gLastDeactReasons);
     WXN_ALOG(@"锁屏=%d", WXNDeviceLocked());
-    WXN_ALOG(@"画面探针：%@（%.0f秒前刷过，共%ld帧） 冻结：%.0f 秒前停了 %.0f 秒",
-             gFrameTicks > 0 ? (WXNFrameAlive() ? @"在刷" : @"停了") : @"不可用",
-             gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1, gFrameTicks,
-             gLastFreezeAt > 0 ? CFAbsoluteTimeGetCurrent() - gLastFreezeAt : -1,
-             gLastFreezeLen);
+    NSString *frontWhy = nil;
+    BOOL inWx = WXNInWeChat(&frontWhy);
+    WXN_ALOG(@"前台状态文件：%@ -> %@", frontWhy ?: @"(空)", inWx ? @"人在微信里" : @"人不在微信里");
     WXN_ALOG(@"backgroundTimeRemaining=%.0f protectedData=%d",
              app.backgroundTimeRemaining, (int)app.protectedDataAvailable);
     @try {
@@ -2110,98 +2101,104 @@ static void WXNInstallAppNotices(void) {
     WXN_ALOG(@"应用通知探针：已监听 %lu 个广播", (unsigned long)gNoticeTokens.count);
 }
 
-// 帧探针：只有微信真的被合成到屏幕上，CADisplayLink 才会回调。
-// 2fps 就够看“画面还在不在”，不烧电。
-@interface WXNFrameWatcher : NSObject
-- (void)tick:(CADisplayLink *)link;
-@end
+// ---------------------------------------------------------------------------
+// SpringBoard 侧守卫（2.12）
+//
+// 同一个 dylib 也会被注进 com.apple.springboard。那里没有沙盒，
+// 问「谁在最前面」是真能拿到答案的；而 Immortalizer 骗的是 App 自己，
+// 骗不到 SpringBoard。所以让它每半秒把答案写进一个文件，微信只负责读。
+//
+// 三条硬规矩：
+//   1) 全部在后台串行队列里跑，绝不占 SpringBoard 的主线程；
+//   2) 任何一次调用卡住就记一次，卡超过 4 次立刻停表，宁可没有数据；
+//   3) 只在值变了、或距上次写超过 5 秒时才落盘，少写闪存。
+// ---------------------------------------------------------------------------
+static volatile int gFrontBusy = 0;
+static volatile int gFrontHangs = 0;
+static double gFrontLastWrite = 0;
+static NSString *gFrontLastLine = nil;
 
-@implementation WXNFrameWatcher
-- (void)tick:(CADisplayLink *)link {
-    double now = CFAbsoluteTimeGetCurrent();
-    // 从“停下来”到“又开始刷”的那一刻，正好把被盖住的时间量出来
-    if (gLastFrameAt > 0 && now - gLastFrameAt > 2.5) {
-        WXN_ALOG(@"画面恢复：之前停了 %.0f 秒", now - gLastFrameAt);
+static NSString *WXNFrontmostBundleID(NSString **apiOut) {
+    typedef CFStringRef (*cf_t)(void);
+    typedef id (*id_t)(void);
+
+    // SpringBoardServices 里的几种写法，哪个有符号用哪个
+    cf_t a = (cf_t)dlsym(RTLD_DEFAULT, "SBSCopyFrontmostApplicationDisplayIdentifier");
+    if (a) {
+        CFStringRef s = a();
+        if (s) {
+            if (apiOut) *apiOut = @"SBSCopyFrontmost";
+            return (__bridge_transfer NSString *)s;
+        }
     }
-    gLastFrameAt = now;
-    gFrameTicks++;
+    cf_t b = (cf_t)dlsym(RTLD_DEFAULT, "SBFrontmostApplicationDisplayIdentifier");
+    if (b) {
+        CFStringRef s = b();
+        if (s) {
+            if (apiOut) *apiOut = @"SBFrontmost";
+            return (__bridge_transfer NSString *)s;
+        }
+    }
+    id_t c = (id_t)dlsym(RTLD_DEFAULT, "SBSGetFrontmostApplication");
+    if (c) {
+        id app = c();
+        if (app) {
+            for (NSString *k in @[ @"displayIdentifier", @"bundleIdentifier" ]) {
+                @try {
+                    id v = [app valueForKey:k];
+                    if ([v isKindOfClass:[NSString class]] && [v length]) {
+                        if (apiOut) *apiOut = @"SBSGetFrontmost";
+                        return v;
+                    }
+                } @catch (__unused NSException *e) {}
+            }
+        }
+    }
+    if (apiOut) *apiOut = @"(全失败)";
+    return nil;
 }
-@end
 
-// 注意：一定要等 App 真的起来了再建这个探针。
-// 2.6 把它放在构造器里（UIApplication 还不存在时就碰 UIScreen），
-// 结果微信卡在地球启动画面进不去。现在改成必须主线程 + App 已启动 + 只在 8 秒后调。
-static void WXNInstallFrameProbe(void) {
-    if (gFrameLink) return;
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ WXNInstallFrameProbe(); });
-        return;
-    }
-    @try {
-        Class dl = NSClassFromString(@"CADisplayLink");
-        SEL make = NSSelectorFromString(@"displayLinkWithTarget:selector:");
-        if (!dl || ![dl respondsToSelector:make]) {
-            WXN_ALOG(@"帧探针：系统没有 CADisplayLink，改用触摸判断");
+static void WXNFrontTick(void) {
+    NSString *api = nil;
+    NSString *bundle = WXNFrontmostBundleID(&api);
+    double ts = [[NSDate date] timeIntervalSince1970];
+    NSString *line = [NSString stringWithFormat:@"%@|%.3f|%d|0|%@",
+                      bundle ?: @"(nil)", ts, (int)WXNDeviceLocked(), api ?: @"?"];
+    if ([line isEqualToString:gFrontLastLine] && ts - gFrontLastWrite < 5.0) return;
+    [line writeToFile:@WXN_FRONT_PATH atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    gFrontLastWrite = ts;
+    gFrontLastLine = line;
+}
+
+static void WXNFrontStart(void) {
+    dispatch_queue_t q = dispatch_queue_create("cn.qwq.wxnotify.front", NULL);
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    if (!t) return;
+    // 5 秒后才开始，等 SpringBoard 自己起稳
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5ull * NSEC_PER_SEC)),
+                              500ull * NSEC_PER_MSEC, 200ull * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{
+        if (gFrontBusy) {
+            if (++gFrontHangs > 4) dispatch_source_cancel(t);
             return;
         }
-        WXNFrameWatcher *w = [[WXNFrameWatcher alloc] init];
-        CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))objc_msgSend)(
-            dl, make, w, @selector(tick:));
-        if (!link) {
-            WXN_ALOG(@"帧探针：displayLink 创建失败，改用触摸判断");
-            return;
-        }
-        SEL psel = NSSelectorFromString(@"setPreferredFramesPerSecond:");
-        if ([link respondsToSelector:psel]) {
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(link, psel, 2);
-        }
-        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        gFrameLink = link;   // 强引用住，别被回收
-        WXN_ALOG(@"帧探针：已启动（2fps）");
-    } @catch (NSException *e) {
-        WXN_ALOG(@"帧探针：启动失败 %@，改用触摸判断", e);
-    }
+        gFrontBusy = 1;
+        @try { WXNFrontTick(); } @catch (__unused NSException *e) {}
+        gFrontBusy = 0;
+    });
+    dispatch_resume(t);
 }
 
-// 冻结检测：realtime 一直在走，monotonic 在进程停摆时不走，两者差值就是停了多久
-static void WXNCheckFreeze(void) {
-    struct timespec rt, mt;
-    clock_gettime(CLOCK_REALTIME, &rt);
-    clock_gettime(CLOCK_MONOTONIC, &mt);
-    double real = rt.tv_sec + rt.tv_nsec / 1e9;
-    double mono = mt.tv_sec + mt.tv_nsec / 1e9;
-    if (gLastBeatReal > 0) {
-        double gap = (real - gLastBeatReal) - (mono - gLastBeatMono);
-        if (gap > 5.0) {
-            gLastFreezeAt = CFAbsoluteTimeGetCurrent();
-            gLastFreezeLen = gap;
-            WXN_ALOG(@"检测到冻结：停了 %.0f 秒（这段时间人不在微信）", gap);
-        }
-    }
-    gLastBeatReal = real;
-    gLastBeatMono = mono;
-}
-
-// 心跳：每 30 秒一行。切到别的 App 时微信自己不会写任何日志，
-// 有了这行才能分清"插件没动静"和"微信整个进程被抓去沉眠了"。
-// expected = 这一次本该跳的时刻，迟到得多就说明进程中间被卡住过。
+// 心跳：每 30 秒一行，看清「前台状态文件说的是谁」。
 static void WXNHeartbeat(double expected) {
-    WXNCheckFreeze();
     double now = CFAbsoluteTimeGetCurrent();
-
     if (expected > 0 && now - expected > 8.0) {
-        gLastFreezeAt = now;
-        gLastFreezeLen = now - expected;
-        WXN_ALOG(@"心跳迟到 %.0f 秒：这段时间进程被卡住/冻住过", now - expected);
+        WXN_ALOG(@"心跳迟到 %.0f 秒：这段时间进程被卡住过", now - expected);
     }
-
-    BOOL frameAlive = WXNFrameAlive();
-    WXN_ALOG(@"心跳 画面=%@（%.0f秒前刷过，共%ld帧） 触摸=%.0f秒 冻结=%.0f秒内 %.0f秒 微信认知后台=%d",
-             frameAlive ? @"在刷" : @"停了",
-             gFrameTicks > 0 ? now - gLastFrameAt : -1, gFrameTicks,
-             gLastTouch > 0 ? now - gLastTouch : -1,
-             gLastFreezeAt > 0 ? now - gLastFreezeAt : -1, gLastFreezeLen,
-             (int)WXNReadLNBG());
+    NSString *why = nil;
+    BOOL in = WXNInWeChat(&why);
+    WXN_ALOG(@"心跳 %@ -> %@ 微信认知后台=%d", why ?: @"(前台状态读不到)",
+             in ? @"人在微信里" : @"人不在微信里", (int)WXNReadLNBG());
 
     double next = CFAbsoluteTimeGetCurrent() + 30.0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
@@ -2212,9 +2209,16 @@ static void WXNHeartbeat(double expected) {
 
 __attribute__((constructor))
 static void WXNInit(void) {
-    // 硬保险：不是微信就什么都不做。filter 里只写了 com.tencent.xin，
-    // 但万一哪天有人把它注进 SpringBoard，这里立刻退出，绝不碰系统进程。
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+
+    // 2.12：同一个 dylib 也注进 SpringBoard，只干一件事——看着谁在最前面。
+    // 这条分支里不写日志、不碰 UI、不碰任何微信的类，只开一个后台定时器。
+    if ([bid isEqualToString:@"com.apple.springboard"]) {
+        WXNFrontStart();
+        return;
+    }
+
+    // 硬保险：不是微信就什么都不做
     if (![bid isEqualToString:@WXN_BUNDLE_ID]) return;
 
     WXN_ALOG(@"======== WxNotify %s 已加载 pid=%d ========", WXN_VERSION, (int)getpid());
@@ -2241,7 +2245,8 @@ static void WXNInit(void) {
     WXNInstallAppNotices();
     WXNInstallLocalNotificationProbe();
     WXNInstallCognitionHooks();
-    WXNInstallTouch();
+    WXNInstallBadge();
+    WXNWatchFront();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
     WXN_ALOG(@"初始化完成（构造器结束），心跳 10 秒后开始");
@@ -2256,7 +2261,6 @@ static void WXNInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNInstallSceneProbe();   // 被别人又盖回去的，重新接管一次
-                       WXNInstallFrameProbe();   // 这时 App 已经起来了，建探针才安全
                        WXNInstallCognitionHooks();
                        WXNDumpCognition();
                        WXNSetupPresentationHooks();
