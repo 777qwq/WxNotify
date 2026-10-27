@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "1.7"
+#define WXN_VERSION     "1.8"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -275,28 +275,78 @@ static NSString *WXNPlaceholder(unsigned int type) {
         case 34: return @"[语音]";
         case 42: return @"[名片]";
         case 43: return @"[视频]";
-        case 47: return @"[表情]";
+        case 47: return @"[动画表情]";
         case 48: return @"[位置]";
         case 49: return @"[链接/文件]";
         case 50: return @"[语音通话]";
+        case 62: return @"[视频号]";
         default: return @"新消息";
+    }
+}
+
+// 从 XML 里取一个标签，优先认 CDATA
+static NSString *WXNXMLField(NSString *xml, NSString *tag) {
+    if (!xml.length || !tag.length) return nil;
+    NSRange o = [xml rangeOfString:[NSString stringWithFormat:@"<%@>", tag]];
+    if (o.location == NSNotFound) return nil;
+    NSUInteger start = NSMaxRange(o);
+    if (start > xml.length) return nil;
+    NSRange rest = NSMakeRange(start, xml.length - start);
+    NSRange cdata = [xml rangeOfString:@"<![CDATA[" options:0 range:rest];
+    if (cdata.location != NSNotFound && cdata.location <= start + 64) {
+        NSUInteger cs = NSMaxRange(cdata);
+        NSRange tail = NSMakeRange(cs, xml.length - cs);
+        NSRange ce = [xml rangeOfString:@"]]>" options:0 range:tail];
+        if (ce.location != NSNotFound) return [xml substringWithRange:NSMakeRange(cs, ce.location - cs)];
+    }
+    NSRange end = [xml rangeOfString:[NSString stringWithFormat:@"</%@>", tag] options:0 range:rest];
+    if (end.location == NSNotFound) return nil;
+    return [xml substringWithRange:NSMakeRange(start, end.location - start)];
+}
+
+// type=49 的应用消息，真正的类型藏在 <appmsg><type> 里
+static NSString *WXNAppMsgText(NSString *xml) {
+    NSInteger sub = [WXNXMLField(xml, @"type") integerValue];
+    NSString *title = WXNXMLField(xml, @"title");
+    switch (sub) {
+        case 57: // 引用回复：正文就是那句回复
+            return title.length ? title : @"[引用消息]";
+        case 6:  case 74:
+            return title.length ? [NSString stringWithFormat:@"[文件] %@", title] : @"[文件]";
+        case 5:  case 4:
+            return title.length ? [NSString stringWithFormat:@"[链接] %@", title] : @"[链接]";
+        case 33: case 36:
+            return title.length ? [NSString stringWithFormat:@"[小程序] %@", title] : @"[小程序]";
+        case 3:
+            return title.length ? [NSString stringWithFormat:@"[音乐] %@", title] : @"[音乐]";
+        case 19:   return @"[聊天记录]";
+        case 2000: return @"[转账]";
+        case 2001: return @"[红包]";
+        case 51: case 63: return @"[视频号]";
+        default:
+            if (title.length) return title;
+            return @"[链接/文件]";
     }
 }
 
 static NSString *WXNBody(id wrap, unsigned int type) {
     NSString *content = WXNStr(wrap, @"m_nsContent");
     if (type == 1 && content.length) return content;
+    if (type == 49 && content.length) return WXNAppMsgText(content);
 
-    // 微信自己渲染的显示内容：图片->[图片]、语音->[语音] …… 版本对得上就用它
+    // 微信自己渲染的显示内容：对得上的版本会直接给出「[图片]」这种文案
     SEL dispSel = NSSelectorFromString(@"GetDisplayContent");
     if ([wrap respondsToSelector:dispSel]) {
         @try {
             id v = ((id (*)(id, SEL))objc_msgSend)(wrap, dispSel);
-            if ([v isKindOfClass:[NSString class]] && [v length]) return (NSString *)v;
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] &&
+                ![(NSString *)v hasPrefix:@"<"]) {
+                return (NSString *)v;
+            }
         } @catch (__unused NSException *e) {
         }
     }
-    if (content.length) return content;
+    if (content.length && ![content hasPrefix:@"<"]) return content;
     return WXNPlaceholder(type);
 }
 
@@ -463,11 +513,94 @@ static NSNumber *WXNUnreadCount(void) {
     return nil;
 }
 
-static void WXNPost(NSString *identifier, NSString *title, NSString *body, NSString *thread) {
+// 自己的 wxid，群聊通讯通知要用它当收件人
+static NSString *WXNSelfUsr(void) {
+    @try {
+        id mgr = WXNService(@"CContactMgr");
+        SEL s = NSSelectorFromString(@"getSelfContact");
+        if (mgr && [mgr respondsToSelector:s]) {
+            id c = ((id (*)(id, SEL))objc_msgSend)(mgr, s);
+            NSString *usr = WXNStr(c, @"m_nsUsrName");
+            if (usr.length) return usr;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return nil;
+}
+
+// 用系统原生的「通讯通知」把横幅画成微信那种带头像的样子。
+// 全部走运行时反射，任何一步对不上就安静退回普通通知，绝不崩。
+static UNNotificationContent *WXNCommunicationContent(UNNotificationContent *base,
+                                                      NSString *senderUsr,
+                                                      NSString *senderName,
+                                                      BOOL isGroup,
+                                                      NSString *session) {
+    Class handleCls = NSClassFromString(@"INPersonHandle");
+    Class personCls = NSClassFromString(@"INPerson");
+    Class intentCls = NSClassFromString(@"INSendMessageIntent");
+    Class speakCls = NSClassFromString(@"INSpeakableString");
+    SEL updSel = NSSelectorFromString(@"contentByUpdatingWithProvider:error:");
+    SEL personInit = NSSelectorFromString(@"initWithPersonHandle:nameComponents:displayName:image:contactIdentifier:customIdentifier:");
+    SEL handleInit = NSSelectorFromString(@"initWithValue:type:");
+    SEL intentInit = NSSelectorFromString(@"initWithRecipients:outgoingMessageType:content:speakableGroupName:conversationIdentifier:serviceName:sender:");
+
+    if (!handleCls || !personCls || !intentCls) {
+        WXN_ALOG(@"头像：系统里没有 Intents");
+        return nil;
+    }
+    if (![base respondsToSelector:updSel]) {
+        WXN_ALOG(@"头像：系统不支持 contentByUpdatingWithProvider:");
+        return nil;
+    }
+    if (![personCls instancesRespondToSelector:personInit] ||
+        ![handleCls instancesRespondToSelector:handleInit] ||
+        ![intentCls instancesRespondToSelector:intentInit]) {
+        WXN_ALOG(@"头像：初始化方法对不上");
+        return nil;
+    }
+
+    @try {
+        id handle = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(
+            [handleCls alloc], handleInit, senderUsr, (NSInteger)0);
+        id sender = ((id (*)(id, SEL, id, id, id, id, id, id))objc_msgSend)(
+            [personCls alloc], personInit, handle, nil, senderName ?: senderUsr, nil, nil, senderUsr);
+
+        NSString *me = WXNSelfUsr();
+        id myHandle = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(
+            [handleCls alloc], handleInit, me ?: @"self", (NSInteger)0);
+        id mePerson = ((id (*)(id, SEL, id, id, id, id, id, id))objc_msgSend)(
+            [personCls alloc], personInit, myHandle, nil, nil, nil, nil, me ?: @"self");
+
+        id groupName = nil;
+        if (isGroup) {
+            NSString *gn = WXNDisplayName(session) ?: @"群聊";
+            if (speakCls && [speakCls instancesRespondToSelector:NSSelectorFromString(@"initWithSpokenPhrase:")]) {
+                groupName = ((id (*)(id, SEL, id))objc_msgSend)(
+                    [speakCls alloc], NSSelectorFromString(@"initWithSpokenPhrase:"), gn);
+            }
+        }
+
+        id intent = ((id (*)(id, SEL, id, NSInteger, id, id, id, id, id))objc_msgSend)(
+            [intentCls alloc], intentInit, @[mePerson], (NSInteger)0, base.body,
+            groupName, session, @"WeChat", sender);
+
+        NSError *err = nil;
+        id updated = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(base, updSel, intent, &err);
+        if ([updated isKindOfClass:[UNNotificationContent class]]) return (UNNotificationContent *)updated;
+        WXN_ALOG(@"头像：合成失败 %@", err.localizedDescription ?: @"返回空");
+    } @catch (NSException *e) {
+        WXN_ALOG(@"头像：异常 %@", e.reason);
+    }
+    return nil;
+}
+
+static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
+                    NSString *thread, NSString *senderUsr, BOOL isGroup) {
     WXNConfig c = WXNConfigCopy();
 
     UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
     content.title = title.length ? title : @"微信";
+    if (subtitle.length) content.subtitle = subtitle;
     content.body = body.length ? body : @"新消息";
     if (c.sound) content.sound = [UNNotificationSound defaultSound];
     if (thread.length) content.threadIdentifier = thread;
@@ -476,13 +609,20 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *body, NSStr
     NSNumber *unread = WXNUnreadCount();
     if (unread) content.badge = unread;
 
+    UNNotificationContent *payload = content;
+    if (senderUsr.length) {
+        NSString *nick = WXNDisplayName(senderUsr) ?: subtitle;
+        UNNotificationContent *c2 = WXNCommunicationContent(content, senderUsr, nick, isGroup, thread);
+        if (c2) payload = c2;
+    }
+
     // 投递前保证 willPresent 已经被我们接管，否则可能被当成前台通知吞掉
     WXNSetupPresentationHooks();
     WXN_ALOG(@"投递前 delegate=%@", NSStringFromClass(object_getClass(
                  [UNUserNotificationCenter currentNotificationCenter].delegate)) ?: @"(无)");
 
     UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:identifier
-                                                                     content:content
+                                                                     content:payload
                                                                      trigger:nil];
     [[UNUserNotificationCenter currentNotificationCenter]
         addNotificationRequest:req
@@ -588,30 +728,30 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
     BOOL isGroup = [session hasSuffix:@"@chatroom"];
 
     NSString *body = WXNBody(wrap, type);
-    NSString *senderUsr = nil;
+    NSString *senderUsr = rawFrom;
     if (isGroup) body = WXNSplitGroupSender(body, &senderUsr);
 
-    NSString *title = nil;
+    // 群聊：主标题群名、副标题昵称；单聊：主标题就是对方
+    NSString *title = WXNDisplayName(session);
+    NSString *subtitle = nil;
     if (isGroup) {
-        title = WXNDisplayName(session);
         if (!title.length) title = @"群聊";
         NSString *nick = WXNDisplayName(senderUsr);
-        if (!nick.length) nick = senderUsr;
-        if (nick.length) body = [NSString stringWithFormat:@"%@: %@", nick, body];
+        subtitle = nick.length ? nick : senderUsr;
     } else {
-        title = WXNDisplayName(session);
         if (!title.length) title = WXNDisplayName(rawFrom);
         if (!title.length) title = @"微信";
     }
 
     if (!cfg.showContent) {
         title = isGroup ? (title ?: @"群聊") : @"微信";
+        subtitle = nil;
         body = @"你收到一条新消息";
     }
 
     body = WXNTrim(WXNCleanBody(body, type) ?: @"新消息", WXN_BODY_MAX);
 
-    WXNPost([@"wxn-" stringByAppendingString:key], title, body, session);
+    WXNPost([@"wxn-" stringByAppendingString:key], title, subtitle, body, session, senderUsr, isGroup);
 }
 
 // ---------------------------------------------------------------------------
@@ -996,7 +1136,27 @@ static void WXNDumpReport(void) {
     @try {
         NSUserDefaults *ip = [[NSUserDefaults alloc] initWithSuiteName:@"com.sergy.immortalizer.prefs"];
         NSArray *sel = [ip objectForKey:@"selectedApplications"];
-        WXN_ALOG(@"Immortalizer selectedApplications=%@，含微信=%@", sel,
+        // 头像的本地路径藏在 CContact 的某个字段里，先把名字记下来
+    Class cc = NSClassFromString(@"CContact");
+    if (cc) {
+        NSMutableArray *hits = [NSMutableArray array];
+        unsigned int cnt = 0;
+        Ivar *ivars = class_copyIvarList(cc, &cnt);
+        for (unsigned int i = 0; i < cnt; i++) {
+            const char *n = ivar_getName(ivars[i]);
+            if (!n) continue;
+            NSString *name = @(n);
+            if ([name rangeOfString:@"ead" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [name rangeOfString:@"mg" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                [hits addObject:name];
+            }
+        }
+        if (ivars) free(ivars);
+        WXN_ALOG(@"CContact 头像相关字段：%@",
+                 hits.count ? [hits componentsJoinedByString:@" / "] : @"(没找到)");
+    }
+
+    WXN_ALOG(@"Immortalizer selectedApplications=%@，含微信=%@", sel,
                  [sel containsObject:@WXN_BUNDLE_ID] ? @"是" : @"否");
     } @catch (__unused NSException *e) {
         WXN_ALOG(@"读 Immortalizer 配置失败");
@@ -1024,9 +1184,10 @@ static void WXNPostBootOnce(void) {
                            WXNPost([NSString stringWithFormat:@"wxn-boot-%d-%@", i,
                                     [[NSUUID UUID] UUIDString]],
                                    [NSString stringWithFormat:@"WxNotify %s 已加载", WXN_VERSION],
+                                   nil,
                                    [NSString stringWithFormat:@"第 %d 条。收到消息会补发横幅。日志：%@",
                                     i + 1, where],
-                                   [@"wxn-boot" stringByAppendingFormat:@"-%d", i]);
+                                   @"wxn-boot", nil, NO);
                        });
     }
 
