@@ -26,6 +26,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/CADisplayLink.h>
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -37,8 +38,9 @@
 #import <stdlib.h>
 #import <string.h>
 
+#include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.5"
+#define WXN_VERSION     "2.6"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -67,6 +69,19 @@ static pthread_mutex_t gCfgLock = PTHREAD_MUTEX_INITIALIZER;
 
 // 上一次用户碰微信屏幕的时刻，用来判断「人是不是正在微信里」
 static double gLastTouch = 0;
+
+// 屏幕刷新探针：只要微信真的显示在屏幕上，CADisplayLink 就会一直回调。
+// 被别的 App 盖住时，即使 scene 被 Immortalizer 假装成前台，画面也不会被合成，
+// 回调就会停。这是“人到底看不看得见微信”唯一不靠猜的线索。
+static volatile double gLastFrameAt = 0;
+static volatile long gFrameTicks = 0;
+static id gFrameLink = nil;
+
+// 冻结检测：CLOCK_REALTIME 与 CLOCK_MONOTONIC 的差值就是“进程停摆了多久”
+static double gLastBeatReal = 0;
+static double gLastBeatMono = 0;
+static volatile double gLastFreezeAt = 0;
+static volatile double gLastFreezeLen = 0;
 
 // 微信 scene 的"被停用"信号：真的切去别的 App、上滑回桌面时才会出现。
 // 沙盒里问不到最前台是谁（SBS 那条路返回 nil），这条是唯一不靠猜的线索。
@@ -477,13 +492,34 @@ static BOOL WXNDeviceLocked(void) {
 
 // 人是不是就在微信里。
 //
-// 沙盒里问不到"谁在最前"（SBS 那条路返回 nil），所以分两档：
-//   1) scene 停用信号能看到 -> 直接采信（真走了才为真，Immortalizer 抹掉之前我们能看见）
-//   2) 看不到 -> 退回"最近一次碰屏幕"，8 秒内碰过就算人在微信里
+// 2.5 的实测结论：Immortalizer 把 scene 停用信号和所有退到后台的广播都抹了，
+// 进程里根本看不到“用户走了”。所以改成看两件它拓不掉的事实：
+//   1) 屏幕还在不在刷新（CADisplayLink）——不在刷就是被人盖住了
+//   2) 进程有没有停摆过（realtime 与 monotonic 的差）——停过就是当时不在前台
+// 两个探针都不可用时，才退回“最近 20 秒内碰过屏幕”。
+static BOOL WXNFrameAlive(void) {
+    if (gFrameTicks == 0) return NO;
+    return (CFAbsoluteTimeGetCurrent() - gLastFrameAt) < 3.0;
+}
+
 static BOOL WXNUserInWeChat(void) {
-    if (gSceneKnown) return !gSceneAway;
+    double now = CFAbsoluteTimeGetCurrent();
+
+    // 刚被解冻：刚才那段时间进程是停摆的，人肯定不在微信里
+    if (gLastFreezeAt > 0 && now - gLastFreezeAt < 15.0) {
+        WXN_LOG(@"  刚冻结过 %.0f 秒，判为人不在微信", gLastFreezeLen);
+        return NO;
+    }
+    // 画面在刷 = 微信真的在屏幕上
+    if (WXNFrameAlive()) return YES;
+    // 探针能用但画面停了 = 被别的 App 盖住 / 锁屏
+    if (gFrameTicks > 0) {
+        WXN_LOG(@"  画面已停 %.0f 秒，判为人不在微信", now - gLastFrameAt);
+        return NO;
+    }
+    // 探针不可用，退回触摸
     if (gLastTouch <= 0) return NO;
-    return (CFAbsoluteTimeGetCurrent() - gLastTouch) < 8.0;
+    return (now - gLastTouch) < 20.0;
 }
 
 static BOOL WXNShouldNotify(void) {
@@ -501,14 +537,15 @@ static BOOL WXNShouldNotify(void) {
     }
 
     if (WXNUserInWeChat()) {
-        WXN_ALOG(@"  跳过：人就在微信里（场景 known=%d away=%d，%.1f 秒前碰过屏幕）",
-                 (int)gSceneKnown, (int)gSceneAway,
+        WXN_ALOG(@"  跳过：人就在微信里（画面 %.0f 秒前刷过，触摸 %.0f 秒前）",
+                 gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1,
                  gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1);
         return NO;
     }
-    WXN_ALOG(@"  人不在微信里（场景 known=%d away=%d，%.1f 秒前碰过屏幕）",
-             (int)gSceneKnown, (int)gSceneAway,
-             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1);
+    WXN_ALOG(@"  人不在微信里（画面 %.0f 秒前刷过，触摸 %.0f 秒前，冻结 %.0f 秒前）",
+             gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1,
+             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
+             gLastFreezeAt > 0 ? CFAbsoluteTimeGetCurrent() - gLastFreezeAt : -1);
     return YES;
 }
 
@@ -1550,6 +1587,11 @@ static void WXNDumpReport(void) {
     WXN_ALOG(@"场景信号：known=%d away=%d reasons=0x%llx（0=能看到 1=被 Immortalizer 全抹了）",
              (int)gSceneKnown, (int)gSceneAway, (unsigned long long)gLastDeactReasons);
     WXN_ALOG(@"锁屏=%d", WXNDeviceLocked());
+    WXN_ALOG(@"画面探针：%@（%.0f秒前刷过，共%ld帧） 冻结：%.0f 秒前停了 %.0f 秒",
+             gFrameTicks > 0 ? (WXNFrameAlive() ? @"在刷" : @"停了") : @"不可用",
+             gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1, gFrameTicks,
+             gLastFreezeAt > 0 ? CFAbsoluteTimeGetCurrent() - gLastFreezeAt : -1,
+             gLastFreezeLen);
     WXN_ALOG(@"backgroundTimeRemaining=%.0f protectedData=%d",
              app.backgroundTimeRemaining, (int)app.protectedDataAvailable);
     @try {
@@ -1664,8 +1706,8 @@ static void WXNPostBootOnce(void) {
 }
 
 // 再补一层零风险的探针：只听系统广播，不改任何行为。
-// 如果连这些广播都被 Immortalizer 吃掉，日志里就一条都不会有；
-// 只要出现一条，就说明微信确实收到了"退到后台"的通知，可以直接拿它当判断依据。
+// 注意：只有“离开”类广播才算证据（known=1），回来类广播满天飞（启动时就一堆），
+// 不能拿它证明什么，否则 known 一上来就是 1，人永远被当成在微信里。
 static NSMutableArray *gNoticeTokens = nil;
 
 static void WXNInstallAppNotices(void) {
@@ -1687,14 +1729,11 @@ static void WXNInstallAppNotices(void) {
                         BOOL away = [n containsString:@"EnterBackground"] ||
                                     [n containsString:@"WillDeactivate"] ||
                                     [n containsString:@"WillResignActive"];
-                        BOOL back = [n containsString:@"Foreground"] ||
-                                    [n containsString:@"DidActivate"] ||
-                                    [n containsString:@"DidBecomeActive"];
                         WXN_ALOG(@"应用通知：%@（判为人已离开=%d）", n, (int)away);
-                        if (away || back) {
+                        if (away) {
                             gSceneKnown = YES;
-                            gSceneAway = away;
-                            gLastDeactReasons = away ? 0xFFFFFFFFull : 0;
+                            gSceneAway = YES;
+                            gLastDeactReasons = 0xFFFFFFFFull;
                         }
                     }];
         if (token) [gNoticeTokens addObject:token];
@@ -1702,13 +1741,69 @@ static void WXNInstallAppNotices(void) {
     WXN_ALOG(@"应用通知探针：已监听 %lu 个广播", (unsigned long)gNoticeTokens.count);
 }
 
+// 帧探针：只有微信真的被合成到屏幕上，CADisplayLink 才会回调。
+// 2fps 就够看“画面还在不在”，不烧电。
+@interface WXNFrameWatcher : NSObject
+- (void)tick:(CADisplayLink *)link;
+@end
+
+@implementation WXNFrameWatcher
+- (void)tick:(CADisplayLink *)link {
+    gLastFrameAt = CFAbsoluteTimeGetCurrent();
+    gFrameTicks++;
+}
+@end
+
+static void WXNInstallFrameProbe(void) {
+    UIScreen *scr = [UIScreen mainScreen];
+    SEL sel = NSSelectorFromString(@"displayLinkWithTarget:selector:");
+    if (!scr || ![scr respondsToSelector:sel]) {
+        WXN_ALOG(@"帧探针：这台系统没有 displayLinkWithTarget:，改用触摸判断");
+        return;
+    }
+    WXNFrameWatcher *w = [[WXNFrameWatcher alloc] init];
+    CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))objc_msgSend)(
+        scr, sel, w, @selector(tick:));
+    if (!link) {
+        WXN_ALOG(@"帧探针：displayLink 创建失败，改用触摸判断");
+        return;
+    }
+    link.preferredFramesPerSecond = 2;
+    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    gFrameLink = link;   // 强引用住，别被回收
+    WXN_ALOG(@"帧探针：已启动（2fps）");
+}
+
+// 冻结检测：realtime 一直在走，monotonic 在进程停摆时不走，两者差值就是停了多久
+static void WXNCheckFreeze(void) {
+    struct timespec rt, mt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    clock_gettime(CLOCK_MONOTONIC, &mt);
+    double real = rt.tv_sec + rt.tv_nsec / 1e9;
+    double mono = mt.tv_sec + mt.tv_nsec / 1e9;
+    if (gLastBeatReal > 0) {
+        double gap = (real - gLastBeatReal) - (mono - gLastBeatMono);
+        if (gap > 5.0) {
+            gLastFreezeAt = CFAbsoluteTimeGetCurrent();
+            gLastFreezeLen = gap;
+            WXN_ALOG(@"检测到冻结：停了 %.0f 秒（这段时间人不在微信）", gap);
+        }
+    }
+    gLastBeatReal = real;
+    gLastBeatMono = mono;
+}
+
 // 心跳：每 30 秒一行。切到别的 App 时微信自己不会写任何日志，
 // 有了这行才能分清"插件没动静"和"微信整个进程被抓去沉眠了"。
 static void WXNHeartbeat(void) {
-    WXN_ALOG(@"心跳 场景 known=%d away=%d reasons=0x%llx 触摸=%.0f秒 锁屏=%d",
-             (int)gSceneKnown, (int)gSceneAway, (unsigned long long)gLastDeactReasons,
-             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
-             (int)WXNDeviceLocked());
+    WXNCheckFreeze();
+    double now = CFAbsoluteTimeGetCurrent();
+    WXN_ALOG(@"心跳 画面=%@（%.0f秒前刷过，共%ld帧） 触摸=%.0f秒 冻结=%.0f秒内 %.0f秒 场景 known=%d away=%d",
+             WXNFrameAlive() ? @"在刷" : @"停了",
+             gFrameTicks > 0 ? now - gLastFrameAt : -1, gFrameTicks,
+             gLastTouch > 0 ? now - gLastTouch : -1,
+             gLastFreezeAt > 0 ? now - gLastFreezeAt : -1, gLastFreezeLen,
+             (int)gSceneKnown, (int)gSceneAway);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNHeartbeat();
@@ -1744,6 +1839,7 @@ static void WXNInit(void) {
 
     WXNInstallSceneProbe();
     WXNInstallAppNotices();
+    WXNInstallFrameProbe();
     WXNInstallTouch();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
