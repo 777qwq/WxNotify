@@ -1,6 +1,6 @@
 # WxNotify · 微信保活状态下的横幅通知
 
-给被 **Immortalizer** 保活的微信补回横幅通知（rootless，arm64 + arm64e，当前版本 **2.21**）。
+给被 **Immortalizer** 保活的微信补回横幅通知（rootless，arm64 + arm64e，当前版本 **2.22**）。
 
 同一个 dylib 注入两个进程：`com.tencent.xin`（干活）和 `com.apple.springboard`（写真实前台状态）。
 本仓库是构建仓：只放源码、打包脚本和 CI 配置，不放成品二进制。
@@ -103,7 +103,6 @@ python3 scripts/package.py --slices out --out dist --ldid ./bin/ldid
 | `sound` | `true` | 提示音（优先用微信包里那条原生提示音，找不到才用系统默认） |
 | `respectMute` | `true` | 是否尊重会话免打扰。命中 `isChatStatusNotifyOpenForMsgWrap:` 为关就不提醒 |
 | `avatar` | `false` | 用系统通讯通知显示发送者。没有 `INImage` 时 iOS 会自己加一条「你与 <wxid>」副标题，所以默认关 |
-| `fallback` | `false` | 微信 1.2 秒内没自己投递时，由本插件补一条。默认关：只让微信那条出去，避免双横幅 |
 | `debug` | `false` | 打日志 |
 
 ## 日志

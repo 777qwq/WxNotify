@@ -1,12 +1,8 @@
 Package: cn.qwq.wxnotify
 Name: WxNotify
-Version: 2.21
+Version: 2.22
 Architecture: iphoneos-arm64
-Description: 让被真后台插件保活的微信在后台运行时重新弹出原生横幅通知
- 保活会让微信始终以为自己在前台，于是不再自行发出通知。
- 本插件在微信与 SpringBoard 两侧协作，由系统告知真实的前台应用，
- 只在用户已离开微信时接管通知呈现，补上横幅、声音与角标。
- 锁屏与微信内不打扰，不修改微信本体。
+Description: 让被保活的微信重新弹出横幅通知
 Depends: mobilesubstrate, firmware (>= 15.0)
 Suggests: com.sergy.immortalizer
 Maintainer: 777qwq

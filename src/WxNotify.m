@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.21"
+#define WXN_VERSION     "2.22"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -61,7 +61,6 @@ typedef struct {
     BOOL sound;        // 播放提示音
     BOOL respectMute;  // 尊重微信的会话免打扰
     BOOL avatar;       // 用系统通讯通知显示发送者头像
-    BOOL fallback;     // 微信没自己发的时候，由我们补一条。2.20 起默认关
     BOOL debug;        // 打日志
 } WXNConfig;
 
@@ -178,9 +177,6 @@ static void WXNLoadConfig(void) {
     c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
     c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : YES;
     c.avatar      = d[@"avatar"]      ? [d[@"avatar"] boolValue]      : NO;
-    // 2.20：补发默认关。只让微信自己那条通知出去，避免"我们投一条、
-    // 它又投一条"把横幅顶成先收回再弹出。想恢复补发写 fallback=true。
-    c.fallback = d[@"fallback"] ? [d[@"fallback"] boolValue] : NO;
     // 日志默认关。想开：plist 里 debug=true，或者放一个空文件
     // /var/mobile/Library/Preferences/cn.qwq.wxnotify.debug（Filza 里新建就行）
     if (d[@"debug"]) c.debug = [d[@"debug"] boolValue];
@@ -188,8 +184,8 @@ static void WXNLoadConfig(void) {
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
-    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d native=%d debug=%d",
-            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.fallback, c.debug);
+    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d debug=%d",
+            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.debug);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +856,7 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
              }];
 }
 
-// 原生优先：先让微信自己发，它不发我们再补
+// 原生优先：只让微信自己发，本插件不再补发
 // ---------------------------------------------------------------------------
 // 场景停用信号
 //
@@ -882,15 +878,11 @@ static NSTimeInterval gLastSceneLogAt = 0;
 // 可以反复调用：后来才加载的类、以及被别人又盖回去的方法，都会被重新接管
 static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
                        NSString *thread, NSString *senderUsr, BOOL isGroup) {
-    WXNConfig c = WXNConfigCopy();
-
+    // 2.22：补发整体移除。横幅一律由微信自己的通知链路出，
+    // 本插件只负责认知翻转 + willPresent 呈现接管；
+    // 微信晚了就晚了，宁可漏一条，不再自己补（补了就会双横幅互相顶）。
     if (!gFakeBG) {
-        // 微信当时真的在后台，它自己会发，补发关了就不插手
-        if (!c.fallback) {
-            WXN_ALOG(@"补发已关闭，这条交给微信自己（%@）", identifier);
-            return;
-        }
-        WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
+        // 微信当时真的在后台，它自己会发，不插手
         return;
     }
     int base = gNativePostsAtStart;
@@ -898,17 +890,12 @@ static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle
                    dispatch_get_main_queue(), ^{
         int now = gNativePosts;
         if (now > base) {
-            WXN_ALOG(@"微信自己发了 %d 条通知，本次不再补发", now - base);
+            WXN_ALOG(@"微信自己发了 %d 条通知（%@）", now - base, identifier);
             WXNEndFakeBackground(@"交给微信");
             return;
         }
         WXNEndFakeBackground(@"微信没发");
-        if (!c.fallback) {
-            WXN_ALOG(@"微信没有自己发，补发已关闭，这条不出横幅");
-            return;
-        }
-        WXN_ALOG(@"微信没有自己发，改由本插件补发");
-        WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
+        WXN_ALOG(@"微信 1.2 秒内没自己发，不补发，这条不出横幅（%@）", identifier);
     });
 }
 
@@ -1849,7 +1836,7 @@ static void WXNPostBootOnce(void) {
                                     [[NSUUID UUID] UUIDString]],
                                    [NSString stringWithFormat:@"WxNotify %s 已加载", WXN_VERSION],
                                    nil,
-                                   [NSString stringWithFormat:@"第 %d 条。收到消息会补发横幅。日志：%@",
+                                   [NSString stringWithFormat:@"第 %d 条。收到消息会弹横幅。日志：%@",
                                     i + 1, where],
                                    @"wxn-boot", nil, NO);
                        });

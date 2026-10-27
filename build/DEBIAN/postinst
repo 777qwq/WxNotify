@@ -7,4 +7,6 @@ killall -9 WeChat >/dev/null 2>&1
 # 抹掉上一轮留下的「守卫把 SpringBoard 弄崩过」标记和过期的最前台状态。
 rm -f /var/mobile/Library/Preferences/cn.qwq.wxnotify.guard
 rm -f /var/mobile/Library/Preferences/cn.qwq.wxnotify.front
+# 日志默认关：重装把之前手动留的 debug 标记一并清掉，装完必然静音
+rm -f /var/mobile/Library/Preferences/cn.qwq.wxnotify.debug
 exit 0
