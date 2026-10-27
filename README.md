@@ -1,6 +1,6 @@
 # WxNotify · 微信保活状态下的横幅通知
 
-给被 **Immortalizer** 保活的微信补回横幅通知（rootless，arm64 + arm64e，当前版本 **2.20**）。
+给被 **Immortalizer** 保活的微信补回横幅通知（rootless，arm64 + arm64e，当前版本 **2.21**）。
 
 同一个 dylib 注入两个进程：`com.tencent.xin`（干活）和 `com.apple.springboard`（写真实前台状态）。
 本仓库是构建仓：只放源码、打包脚本和 CI 配置，不放成品二进制。
@@ -22,7 +22,8 @@ Immortalizer 的「真后台」本质是骗 SpringBoard：它吞掉
 
 四个环节，缺一不可。
 
-**一、SpringBoard 守卫写真实前台。** 注入 SpringBoard 后起一个 0.5 秒的定时器，
+**一、SpringBoard 守卫写真实前台。** 注入 SpringBoard 后起一个定时器（解锁 1 秒、锁屏 60 秒，解锁那一刻由
+`com.apple.springboard.lockstate` 事件立即补一拍，锁屏时连前台查询都省掉），
 用 `SBSCopyFrontmostApplicationDisplayIdentifier()` 取真正的最前台 bundle id
 （主屏 / 锁屏时返回 `(nil)`），连同时间戳、是否锁屏、是否有遮罩写成一行：
 

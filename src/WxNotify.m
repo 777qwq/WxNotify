@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.20"
+#define WXN_VERSION     "2.21"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1980,25 +1980,32 @@ static void WXNFrontTick(void) {
     const char *api = "?";
     int r;
 
-    // 三条路依次试，哪条给出野指针就永久拉黑
-    if (!gApiDead[0]) {
-        void *fn = dlsym(RTLD_DEFAULT, "SBSCopyFrontmostApplicationDisplayIdentifier");
-        if (fn) {
-            r = WXNCFStrCopy(((const void *(*)(void))fn)(), bundle, sizeof bundle);
-            if (r == 1) api = "SBSCopy";
-            else if (r < 0) gApiDead[0] = YES;
+    // 锁屏时最前台恒为 nil，微信那边只看 locked 这个字段，
+    // 所以这一次私有 API 调用可以直接省掉
+    BOOL locked = WXNDeviceLocked();
+    if (locked) {
+        api = "locked";
+    } else {
+        // 三条路依次试，哪条给出野指针就永久拉黑
+        if (!gApiDead[0]) {
+            void *fn = dlsym(RTLD_DEFAULT, "SBSCopyFrontmostApplicationDisplayIdentifier");
+            if (fn) {
+                r = WXNCFStrCopy(((const void *(*)(void))fn)(), bundle, sizeof bundle);
+                if (r == 1) api = "SBSCopy";
+                else if (r < 0) gApiDead[0] = YES;
+            }
         }
-    }
-    if (!bundle[0] && !gApiDead[1]) {
-        void *fn = dlsym(RTLD_DEFAULT, "SBFrontmostApplicationDisplayIdentifier");
-        if (fn) {
-            r = WXNCFStrCopy(((const void *(*)(void))fn)(), bundle, sizeof bundle);
-            if (r == 1) api = "SBStr";
-            else if (r < 0) gApiDead[1] = YES;
+        if (!bundle[0] && !gApiDead[1]) {
+            void *fn = dlsym(RTLD_DEFAULT, "SBFrontmostApplicationDisplayIdentifier");
+            if (fn) {
+                r = WXNCFStrCopy(((const void *(*)(void))fn)(), bundle, sizeof bundle);
+                if (r == 1) api = "SBStr";
+                else if (r < 0) gApiDead[1] = YES;
+            }
         }
-    }
-    if (!bundle[0] && !gApiDead[2]) {
-        if (WXNFrontAppBundle(bundle, sizeof bundle)) api = "SBApp";
+        if (!bundle[0] && !gApiDead[2]) {
+            if (WXNFrontAppBundle(bundle, sizeof bundle)) api = "SBApp";
+        }
     }
 
     if (!bundle[0]) snprintf(bundle, sizeof bundle, "(nil)");
@@ -2008,8 +2015,7 @@ static void WXNFrontTick(void) {
 
     double ts = [[NSDate date] timeIntervalSince1970];
     char line[256];
-    snprintf(line, sizeof line, "%s|%.3f|%d|0|%s",
-             bundle, ts, (int)WXNDeviceLocked(), api);
+    snprintf(line, sizeof line, "%s|%.3f|%d|0|%s", bundle, ts, (int)locked, api);
 
     // 值没变也至少 2 秒刷一次时间戳：微信那边超过 5 秒没更新就当守卫失联
     if (gFrontLastLine && strcmp(line, gFrontLastLine) == 0 && ts - gFrontLastWrite < 2.0) return;
@@ -2045,25 +2051,80 @@ static BOOL WXNGuardAllowed(void) {
     return YES;
 }
 
+static dispatch_source_t gFrontTimer = NULL;
+static int  gFrontLockTok = -1;
+static BOOL gFrontLocked = NO;
+
+static void WXNFrontSetInterval(BOOL locked, BOOL fireSoon) {
+    gFrontLocked = locked;
+    if (!gFrontTimer) return;
+    uint64_t iv = (locked ? 60ull : 1ull) * NSEC_PER_SEC;
+    uint64_t first = fireSoon ? (100ull * NSEC_PER_MSEC) : iv;
+    dispatch_source_set_timer(gFrontTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)first),
+                              iv, 200ull * NSEC_PER_MSEC);
+}
+
+static void WXNFrontTick(void);
+
+static void WXNFrontRun(void) {
+    if (gFrontBusy) {
+        if (++gFrontHangs > 4 && gFrontTimer) {
+            dispatch_source_cancel(gFrontTimer);
+            gFrontTimer = NULL;
+        }
+        return;
+    }
+    gFrontBusy = 1;
+    @try { WXNFrontTick(); } @catch (__unused NSException *e) {}
+    gFrontBusy = 0;
+
+    // 锁屏通知万一漏了，跑完一拍自己纠回来
+    BOOL locked = WXNDeviceLocked();
+    if (locked != gFrontLocked) WXNFrontSetInterval(locked, NO);
+}
+
+static void WXNFrontWatchLock(dispatch_queue_t q) {
+    int st = notify_register_dispatch("com.apple.springboard.lockstate", &gFrontLockTok, q, ^(int t) {
+        uint64_t v = 0;
+        BOOL locked = (notify_get_state(t, &v) == NOTIFY_STATUS_OK) && v != 0;
+        if (locked) {
+            // 先把 locked=1 落盘，微信那边就能立刻按"人不在"处理，
+            // 然后降到 60 秒慢心跳
+            if (!gFrontBusy) {
+                gFrontBusy = 1;
+                @try { WXNFrontTick(); } @catch (__unused NSException *e) {}
+                gFrontBusy = 0;
+            }
+            WXNFrontSetInterval(YES, NO);
+        } else {
+            // 解锁：立刻写一次真实前台，别留空窗，之后按 1 秒走
+            WXNFrontSetInterval(NO, YES);
+        }
+    });
+    if (st != NOTIFY_STATUS_OK) gFrontLockTok = -1;
+}
+
 static void WXNFrontStart(void) {
     if (!WXNGuardAllowed()) return;
 
     dispatch_queue_t q = dispatch_queue_create("cn.qwq.wxnotify.front", NULL);
     dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     if (!t) return;
-    // 5 秒后才开始，等 SpringBoard 自己起稳
+    gFrontTimer = t;
+
+    // 锁屏 60 秒、解锁 1 秒：锁屏时不过是为了让状态文件别过期，
+    // 解锁后才是真正要判断"人还在不在微信里"的时候。
+    // 只改 interval，不用 suspend/resume——dispatch source 的挂起是引用计数，
+    // 一次没配平就再也起不来，而且卡住时没有任何日志。
+    gFrontLocked = WXNDeviceLocked();
     dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5ull * NSEC_PER_SEC)),
-                              500ull * NSEC_PER_MSEC, 200ull * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(t, ^{
-        if (gFrontBusy) {
-            if (++gFrontHangs > 4) dispatch_source_cancel(t);
-            return;
-        }
-        gFrontBusy = 1;
-        @try { WXNFrontTick(); } @catch (__unused NSException *e) {}
-        gFrontBusy = 0;
-    });
+                              (gFrontLocked ? 60ull : 1ull) * NSEC_PER_SEC, 200ull * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{ WXNFrontRun(); });
     dispatch_resume(t);
+
+    // 解锁那一下必须当成事件来处理：只降频率的话，解锁开头会有
+    // 最多一个周期的空窗，那时候用户往往正回到微信，会误弹。
+    WXNFrontWatchLock(q);
 
     // 撑过 30 秒说明这一轮没炸，下次重启照常跑
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30ull * NSEC_PER_SEC)), q, ^{

@@ -1,12 +1,12 @@
 Package: cn.qwq.wxnotify
-Name: 微信后台通知补发
-Version: 2.20
+Name: WxNotify
+Version: 2.21
 Architecture: iphoneos-arm64
-Description: 给被 Immortalizer 保活的微信补回后台横幅通知。
- Immortalizer 让微信一直以为自己在前台，微信因此不会自己发本地通知。
- 本插件在微信进程内接管消息到达，用 SpringBoard 写的真实前台状态判断
- 「人已经离开微信」，再接管通知呈现，强制给横幅、声音、角标。
- 不依赖 Immortalizer 的「前台通知」开关（实测那个开关对微信无效）。
+Description: 让被真后台插件保活的微信在后台运行时重新弹出原生横幅通知
+ 保活会让微信始终以为自己在前台，于是不再自行发出通知。
+ 本插件在微信与 SpringBoard 两侧协作，由系统告知真实的前台应用，
+ 只在用户已离开微信时接管通知呈现，补上横幅、声音与角标。
+ 锁屏与微信内不打扰，不修改微信本体。
 Depends: mobilesubstrate, firmware (>= 15.0)
 Suggests: com.sergy.immortalizer
 Maintainer: 777qwq
