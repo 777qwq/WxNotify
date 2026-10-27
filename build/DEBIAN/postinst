@@ -2,4 +2,9 @@
 # 装完把微信杀掉，下次启动才会注入 WxNotify
 killall -9 WeChat >/dev/null 2>&1
 [ -x /var/jb/usr/bin/killall ] && /var/jb/usr/bin/killall -9 WeChat >/dev/null 2>&1
+
+# 重装等于重新给 SpringBoard 侧守卫一次机会：
+# 抹掉上一轮留下的「守卫把 SpringBoard 弄崩过」标记和过期的最前台状态。
+rm -f /var/mobile/Library/Preferences/cn.qwq.wxnotify.guard
+rm -f /var/mobile/Library/Preferences/cn.qwq.wxnotify.front
 exit 0

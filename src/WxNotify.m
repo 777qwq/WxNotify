@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.13"
+#define WXN_VERSION     "2.14"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -2117,60 +2117,73 @@ static void WXNInstallAppNotices(void) {
 }
 
 // ---------------------------------------------------------------------------
-// SpringBoard 侧守卫（2.12）
+// SpringBoard 侧守卫（2.14）
 //
 // 同一个 dylib 也会被注进 com.apple.springboard。那里没有沙盒，
 // 问「谁在最前面」是真能拿到答案的；而 Immortalizer 骗的是 App 自己，
 // 骗不到 SpringBoard。所以让它每半秒把答案写进一个文件，微信只负责读。
 //
-// 三条硬规矩：
-//   1) 全部在后台串行队列里跑，绝不占 SpringBoard 的主线程；
-//   2) 任何一次调用卡住就记一次，卡超过 4 次立刻停表，宁可没有数据；
-//   3) 只在值变了、或距上次写超过 5 秒时才落盘，少写闪存。
+// 2.13 的教训：__CFStringAppendFormatCore → objc_opt_respondsToSelector
+// 读 0x10000003，SIGSEGV，SpringBoard 直接进安全模式。从 dlsym 摸出来的
+// 东西不一定是函数，返回值也不一定是我们以为的类型。现在的规矩：
+//   1) 返回值先验地址（>= 4GB、8 字节对齐），可疑就当没拿到；
+//   2) 再用 CFGetTypeID 确认真是 CFString，才拷进栈上缓冲；
+//   3) 哪个接口给过野指针就永久拉黑，不再调；
+//   4) 全程 snprintf 拼字符串，绝不把未知对象塞进 %@。
 // ---------------------------------------------------------------------------
 static volatile int gFrontBusy = 0;
 static volatile int gFrontHangs = 0;
 static double gFrontLastWrite = 0;
-static NSString *gFrontLastLine = nil;
+static char *gFrontLastLine = NULL;
+static BOOL gApiDead[3];          // 0=SBSCopy 1=SBStr 2=SBApp
 
-static NSString *WXNFrontmostBundleID(NSString **apiOut) {
-    typedef CFStringRef (*cf_t)(void);
-    typedef id (*id_t)(void);
+static BOOL WXNPtrSane(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    return v >= 0x100000000ULL && (v & 0x7ULL) == 0;
+}
 
-    // SpringBoardServices 里的几种写法，哪个有符号用哪个
-    cf_t a = (cf_t)dlsym(RTLD_DEFAULT, "SBSCopyFrontmostApplicationDisplayIdentifier");
-    if (a) {
-        CFStringRef s = a();
-        if (s) {
-            if (apiOut) *apiOut = @"SBSCopyFrontmost";
-            return (__bridge_transfer NSString *)s;
-        }
+// Bundle id 只可能是这些字符，别的一律当没拿到（不是拉黑，只是不用这个值）
+static BOOL WXNLookLikeBundleID(const char *s) {
+    size_t n = strlen(s);
+    if (n < 3 || n > 127) return NO;
+    if (!strchr(s, '.') || s[0] == '.' || s[n - 1] == '.') return NO;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        BOOL ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+        if (!ok) return NO;
     }
-    cf_t b = (cf_t)dlsym(RTLD_DEFAULT, "SBFrontmostApplicationDisplayIdentifier");
-    if (b) {
-        CFStringRef s = b();
-        if (s) {
-            if (apiOut) *apiOut = @"SBFrontmost";
-            return (__bridge_transfer NSString *)s;
-        }
-    }
-    id_t c = (id_t)dlsym(RTLD_DEFAULT, "SBSGetFrontmostApplication");
-    if (c) {
-        id app = c();
-        if (app) {
-            for (NSString *k in @[ @"displayIdentifier", @"bundleIdentifier" ]) {
-                @try {
-                    id v = [app valueForKey:k];
-                    if ([v isKindOfClass:[NSString class]] && [v length]) {
-                        if (apiOut) *apiOut = @"SBSGetFrontmost";
-                        return v;
-                    }
-                } @catch (__unused NSException *e) {}
+    return YES;
+}
+
+// 0=没值，1=拿到，-1=野指针（这个接口以后别再用）
+static int WXNCFStrCopy(const void *s, char *buf, size_t cap) {
+    if (!s) return 0;
+    if (!WXNPtrSane(s)) return -1;
+    if (CFGetTypeID((CFTypeRef)s) != CFStringGetTypeID()) return -1;
+    Boolean ok = CFStringGetCString((CFStringRef)s, buf, (CFIndex)cap, kCFStringEncodingUTF8);
+    CFRelease((CFTypeRef)s);          // Copy 语义，+1
+    if (!ok || !buf[0]) return 0;
+    if (!WXNLookLikeBundleID(buf)) { buf[0] = 0; return 0; }
+    return 1;
+}
+
+// SBSGetFrontmostApplication 这条路返回的是 SBApplication 对象
+static BOOL WXNFrontAppBundle(char *buf, size_t cap) {
+    void *fn = dlsym(RTLD_DEFAULT, "SBSGetFrontmostApplication");
+    if (!fn) return NO;
+    __unsafe_unretained id app = ((id (*)(void))fn)();
+    if (!WXNPtrSane((__bridge const void *)app)) return NO;
+    for (NSString *k in @[ @"displayIdentifier", @"bundleIdentifier" ]) {
+        @try {
+            __unsafe_unretained id v = [app valueForKey:k];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) {
+                const char *c = [(NSString *)v UTF8String];
+                if (c && *c && WXNLookLikeBundleID(c)) { snprintf(buf, cap, "%s", c); return YES; }
             }
-        }
+        } @catch (__unused NSException *e) {}
     }
-    if (apiOut) *apiOut = @"(全失败)";
-    return nil;
+    return NO;
 }
 
 // 微信的 Documents 目录。SpringBoard 有跨容器访问权，能拿到别人的沙盒路径；
@@ -2213,27 +2226,78 @@ static NSString *WXNWeChatDocs(void) {
 }
 
 static void WXNFrontTick(void) {
-    NSString *api = nil;
-    NSString *bundle = WXNFrontmostBundleID(&api);
+    char bundle[160] = "";
+    const char *api = "?";
+    int r;
+
+    // 三条路依次试，哪条给出野指针就永久拉黑
+    if (!gApiDead[0]) {
+        void *fn = dlsym(RTLD_DEFAULT, "SBSCopyFrontmostApplicationDisplayIdentifier");
+        if (fn) {
+            r = WXNCFStrCopy(((const void *(*)(void))fn)(), bundle, sizeof bundle);
+            if (r == 1) api = "SBSCopy";
+            else if (r < 0) gApiDead[0] = YES;
+        }
+    }
+    if (!bundle[0] && !gApiDead[1]) {
+        void *fn = dlsym(RTLD_DEFAULT, "SBFrontmostApplicationDisplayIdentifier");
+        if (fn) {
+            r = WXNCFStrCopy(((const void *(*)(void))fn)(), bundle, sizeof bundle);
+            if (r == 1) api = "SBStr";
+            else if (r < 0) gApiDead[1] = YES;
+        }
+    }
+    if (!bundle[0] && !gApiDead[2]) {
+        if (WXNFrontAppBundle(bundle, sizeof bundle)) api = "SBApp";
+    }
+
+    if (!bundle[0]) snprintf(bundle, sizeof bundle, "(nil)");
+    for (char *p = bundle; *p; p++) {                 // 别让内容把分隔符搞乱
+        if (*p == '|' || *p == '\n' || *p == '\r') *p = '_';
+    }
+
     double ts = [[NSDate date] timeIntervalSince1970];
-    NSString *line = [NSString stringWithFormat:@"%@|%.3f|%d|0|%@",
-                      bundle ?: @"(nil)", ts, (int)WXNDeviceLocked(), api ?: @"?"];
+    char line[256];
+    snprintf(line, sizeof line, "%s|%.3f|%d|0|%s",
+             bundle, ts, (int)WXNDeviceLocked(), api);
 
     // 值没变也至少 2 秒刷一次时间戳：微信那边超过 5 秒没更新就当守卫失联
-    if ([line isEqualToString:gFrontLastLine] && ts - gFrontLastWrite < 2.0) return;
-    [line writeToFile:@WXN_FRONT_PATH atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    if (gFrontLastLine && strcmp(line, gFrontLastLine) == 0 && ts - gFrontLastWrite < 2.0) return;
+
+    NSString *text = @(line);
+    [text writeToFile:@WXN_FRONT_PATH atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 
     NSString *docs = WXNWeChatDocs();
     if (docs) {
-        [line writeToFile:[docs stringByAppendingPathComponent:@"wxnotify.front"]
+        [text writeToFile:[docs stringByAppendingPathComponent:@"wxnotify.front"]
                atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     }
 
     gFrontLastWrite = ts;
-    gFrontLastLine = line;
+    free(gFrontLastLine);
+    gFrontLastLine = strdup(line);
+}
+
+#define WXN_GUARD_MARK "/var/mobile/Library/Preferences/cn.qwq.wxnotify.guard"
+
+// 上一次也是刚起来就死了：这一轮宁可没有数据，也不能再让 SpringBoard 进安全模式。
+// 重装 deb 会删掉这个标记（postinst），就又能试一次。
+static BOOL WXNGuardAllowed(void) {
+    NSString *m = [NSString stringWithContentsOfFile:@WXN_GUARD_MARK
+                                            encoding:NSUTF8StringEncoding error:NULL];
+    m = [m stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([m isEqualToString:@"booting"]) {
+        [@"dead" writeToFile:@WXN_GUARD_MARK atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        return NO;
+    }
+    if ([m isEqualToString:@"dead"]) return NO;
+    [@"booting" writeToFile:@WXN_GUARD_MARK atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    return YES;
 }
 
 static void WXNFrontStart(void) {
+    if (!WXNGuardAllowed()) return;
+
     dispatch_queue_t q = dispatch_queue_create("cn.qwq.wxnotify.front", NULL);
     dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     if (!t) return;
@@ -2250,6 +2314,11 @@ static void WXNFrontStart(void) {
         gFrontBusy = 0;
     });
     dispatch_resume(t);
+
+    // 撑过 30 秒说明这一轮没炸，下次重启照常跑
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30ull * NSEC_PER_SEC)), q, ^{
+        [@"ok" writeToFile:@WXN_GUARD_MARK atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    });
 }
 
 // 心跳：每 30 秒一行，看清「前台状态文件说的是谁」。
