@@ -1,6 +1,6 @@
 # WxNotify · 微信保活状态下的横幅通知
 
-给被 **Immortalizer** 保活的微信补回横幅通知（rootless，arm64 + arm64e，当前版本 **2.22**）。
+给被 **Immortalizer** 保活的微信补回横幅通知（rootless，arm64 + arm64e，当前版本 **2.23**）。
 
 同一个 dylib 注入两个进程：`com.tencent.xin`（干活）和 `com.apple.springboard`（写真实前台状态）。
 本仓库是构建仓：只放源码、打包脚本和 CI 配置，不放成品二进制。

@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.22"
+#define WXN_VERSION     "2.23"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1258,14 +1258,9 @@ static void WXNHookDelegateClass(Class cls) {
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
-    NSUInteger opts = UNNotificationPresentationOptionNone;
-    if (WXNForcePresentation()) {
-        opts = UNNotificationPresentationOptionBanner |
-               UNNotificationPresentationOptionList |
-               UNNotificationPresentationOptionSound |
-               UNNotificationPresentationOptionBadge;
-    }
-    if (completionHandler) completionHandler(opts);
+    // 2.23：与被接管的原生代理走同一段逻辑（去重/防重）。
+    // 之前这里是简化版、没有去重——代理在岗时第二条横幅永远压不掉。
+    WXNWillPresent(self, _cmd, center, notification, completionHandler);
 }
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
