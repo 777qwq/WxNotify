@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.14"
+#define WXN_VERSION     "2.15"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -1894,6 +1894,26 @@ static void WXNInstallBadge(void) {
 // 但“人回到微信”这件事还得知道——用来清角标、写一条“回来了”的日志。
 static BOOL gWasInWeChat = NO;
 
+// 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
+// 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
+// 只在 debug 打开时探，两分钟最多一条，别刷屏。
+static double gLastProbeAt = 0;
+
+static void WXNProbeOnLeave(void) {
+    if (!WXNDebug()) return;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastProbeAt < 120.0) return;
+    gLastProbeAt = now;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        WXN_ALOG(@"探针：人已离开微信，投一条测试通知，看横幅画不画得出来");
+        WXNPost([@"wxn-probe-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
+                @"前台探针", nil,
+                @"看到这条横幅，说明离开微信后能弹了。",
+                @"wxn-probe", nil, NO);
+    });
+}
+
 static void WXNWatchFront(void) {
     @try {
         NSString *why = nil;
@@ -1901,6 +1921,7 @@ static void WXNWatchFront(void) {
         if (in != gWasInWeChat) {
             gWasInWeChat = in;
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
+            if (!in) WXNProbeOnLeave();
         }
         if (in && gBadge > 0) {
             WXNBadgeReset(@"回到微信");
