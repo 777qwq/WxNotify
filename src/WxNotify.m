@@ -992,7 +992,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    WXN_ALOG(@"  准备补发 session=%@", session);
+    WXN_ALOG(@"  命中，交给微信原生链路 session=%@", session);
 
     unsigned int localID = WXNUInt(wrap, @"m_uiMesLocalID");
     long long svrID = WXNLongLong(wrap, @"m_n64MesSvrID");
