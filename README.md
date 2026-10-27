@@ -59,11 +59,37 @@ python3 scripts/package.py --slices out --out dist --ldid ./bin/ldid
 只钩 `CMessageMgr` 的 `AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:`
 （以及三参数旧版 `AsyncOnAddMsgForSession:MsgWrap:`）。触发条件是：
 
-- `UIApplication.applicationState == Active`（真后台交给微信自己发，避免重复弹）；
+- `applicationState` 不是 `Background`（真后台交给微信自己发，避免重复弹）；
 - 且 `SBSCopyFrontmostApplicationDisplayIdentifier()` 不是 `com.tencent.xin`（人没在微信里）。
 
 另外会跳过：自己发出的消息、系统消息（10000/10002/51）、创建时间超过 120 秒的补拉历史消息、
 以及 128 条内的重复消息（按 会话 + localID + svrID + 时间 去重）。
+
+### 为什么还要接管 willPresent
+
+仅仅把通知投递出去不够。只要 UNS 认为微信在前台，投递进来的通知会走
+`userNotificationCenter:willPresentNotification:withCompletionHandler:`（前台呈现），
+由微信自己的代理决定弹不弹；微信在“前台”时返回的是 `.none`，于是横幅和声音全无。
+
+所以本库还会接管这个回调：只要人不在微信里，就强制返回
+`banner | list | sound | badge`。这样即使 Immortalizer 的「选定应用启用前台通知」开关没开，
+通知也不会被吞。微信没设代理时，本库自己装一个代理把这条路补上。
+
+角标取自微信自己的未读总数（`CMessageMgr` 的 `GetAllUnreadCount` 等，取不到就不动）。
+
+## 日志与自检
+
+日志固定写到 `/var/mobile/Library/Preferences/cn.qwq.wxnotify.log`（写不了就退到
+`/var/mobile/Library/Caches/`），同时走 NSLog。加载、挂钩结果、投递失败总是记；
+每条消息的判断细节需要 `debug=true`。
+
+```sh
+notifyutil -p cn.qwq.wxnotify.diag   # 写一份完整诊断：状态、最前台、钩子、权限、Immortalizer 开关
+notifyutil -p cn.qwq.wxnotify.test   # 投一条测试通知
+```
+
+诊断里的 `sel ...` 行会把 `CMessageMgr` 里所有含 `AddMsg` / `NewMsg` / `Notify` 的方法名列出来，
+微信改名字时可以照着重配钩子。
 
 ## 配置
 
@@ -79,6 +105,7 @@ python3 scripts/package.py --slices out --out dist --ldid ./bin/ldid
 | `debug` | `false` | 打日志 |
 
 自检：`notifyutil -p cn.qwq.wxnotify.test` 投一条测试通知，能看到横幅就说明两半都通了。
+`debug` 打开后每条消息的判断过程都会进日志。
 
 `CMessageMgr` / `CMessageWrap` / `CContactMgr` 都是私有类，所有取值走 `respondsToSelector` + KVC，
 版本对不上时静默降级（例如找不到 `AsyncOnAddMsgForSession:` 时本库什么都不做，不会崩）。
