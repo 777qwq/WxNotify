@@ -88,8 +88,11 @@ python3 scripts/package.py --slices out --out dist --ldid ./bin/ldid
 （Documents 写不进去才退到 `/var/mobile/Library/Preferences/wxnotify.log`。）
 
 启动 8 秒和 20 秒后会自动写一份完整诊断；装好后第一次打开微信还会弹一条
-「WxNotify 已加载」的自检通知，看到它就说明库已经注进去了。之后每条消息的判断过程
-都会进日志（`debug` 默认开）。
+两条「WxNotify 已加载」的自检通知（间隔 2 秒），看到它就说明库已经注进去了。
+
+之后每条消息都会先记一行「命中」，再逐条写下跳过或补发的理由——包括命中的是哪个钩子、
+消息类型、会话、`applicationState`、最前台应用。微信自己投的每一条通知也会被记成
+`[投递]`，所以从日志能直接分清「微信没发」还是「发了被吞」。
 
 ```sh
 notifyutil -p cn.qwq.wxnotify.diag   # 写一份完整诊断：状态、最前台、钩子、权限、Immortalizer 开关
