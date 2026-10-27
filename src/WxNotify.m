@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.19"
+#define WXN_VERSION     "2.20"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -61,7 +61,7 @@ typedef struct {
     BOOL sound;        // 播放提示音
     BOOL respectMute;  // 尊重微信的会话免打扰
     BOOL avatar;       // 用系统通讯通知显示发送者头像
-    BOOL nativeNotify; // 先让微信自己发（临时把它当成"在后台"），它不发我们再补
+    BOOL fallback;     // 微信没自己发的时候，由我们补一条。2.20 起默认关
     BOOL debug;        // 打日志
 } WXNConfig;
 
@@ -178,9 +178,9 @@ static void WXNLoadConfig(void) {
     c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
     c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : YES;
     c.avatar      = d[@"avatar"]      ? [d[@"avatar"] boolValue]      : NO;
-    // 2.0 的实测结论：微信那条通知链路不看 applicationState，假装后台没叫醒它。
-    // 代码留着当实验开关，默认关，免得白等 1.2 秒。
-    c.nativeNotify = d[@"nativeNotify"] ? [d[@"nativeNotify"] boolValue] : NO;
+    // 2.20：补发默认关。只让微信自己那条通知出去，避免"我们投一条、
+    // 它又投一条"把横幅顶成先收回再弹出。想恢复补发写 fallback=true。
+    c.fallback = d[@"fallback"] ? [d[@"fallback"] boolValue] : NO;
     // 日志默认关。想开：plist 里 debug=true，或者放一个空文件
     // /var/mobile/Library/Preferences/cn.qwq.wxnotify.debug（Filza 里新建就行）
     if (d[@"debug"]) c.debug = [d[@"debug"] boolValue];
@@ -189,7 +189,7 @@ static void WXNLoadConfig(void) {
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
     WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d native=%d debug=%d",
-            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.nativeNotify, c.debug);
+            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.fallback, c.debug);
 }
 
 // ---------------------------------------------------------------------------
@@ -882,7 +882,14 @@ static NSTimeInterval gLastSceneLogAt = 0;
 // 可以反复调用：后来才加载的类、以及被别人又盖回去的方法，都会被重新接管
 static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
                        NSString *thread, NSString *senderUsr, BOOL isGroup) {
+    WXNConfig c = WXNConfigCopy();
+
     if (!gFakeBG) {
+        // 微信当时真的在后台，它自己会发，补发关了就不插手
+        if (!c.fallback) {
+            WXN_ALOG(@"补发已关闭，这条交给微信自己（%@）", identifier);
+            return;
+        }
         WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
         return;
     }
@@ -895,7 +902,11 @@ static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle
             WXNEndFakeBackground(@"交给微信");
             return;
         }
-        WXNEndFakeBackground(@"微信没发，本插件兜底");
+        WXNEndFakeBackground(@"微信没发");
+        if (!c.fallback) {
+            WXN_ALOG(@"微信没有自己发，补发已关闭，这条不出横幅");
+            return;
+        }
         WXN_ALOG(@"微信没有自己发，改由本插件补发");
         WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
     });
