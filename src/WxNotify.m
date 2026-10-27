@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.7"
+#define WXN_VERSION     "2.8"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -1245,10 +1245,11 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
     // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
     // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
     // 人不在微信里 -> 给足横幅+声音+角标，别被 Immortalizer 那个开关吃掉。
-    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 强制=%d 场景 known=%d away=%d 触摸=%.1f 秒前",
+    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 强制=%d 画面=%.1f秒前刷过 触摸=%.1f秒前 冻结=%.1f秒前",
              NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)gForceNextBanner,
-             (int)gSceneKnown, (int)gSceneAway,
-             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1);
+             gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1,
+             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
+             gLastFreezeAt > 0 ? CFAbsoluteTimeGetCurrent() - gLastFreezeAt : -1);
 
     if (inWeChat) {
         WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
@@ -1749,7 +1750,12 @@ static void WXNInstallAppNotices(void) {
 
 @implementation WXNFrameWatcher
 - (void)tick:(CADisplayLink *)link {
-    gLastFrameAt = CFAbsoluteTimeGetCurrent();
+    double now = CFAbsoluteTimeGetCurrent();
+    // 从“停下来”到“又开始刷”的那一刻，正好把被盖住的时间量出来
+    if (gLastFrameAt > 0 && now - gLastFrameAt > 2.5) {
+        WXN_ALOG(@"画面恢复：之前停了 %.0f 秒", now - gLastFrameAt);
+    }
+    gLastFrameAt = now;
     gFrameTicks++;
 }
 @end
@@ -1810,18 +1816,29 @@ static void WXNCheckFreeze(void) {
 
 // 心跳：每 30 秒一行。切到别的 App 时微信自己不会写任何日志，
 // 有了这行才能分清"插件没动静"和"微信整个进程被抓去沉眠了"。
-static void WXNHeartbeat(void) {
+// expected = 这一次本该跳的时刻，迟到得多就说明进程中间被卡住过。
+static void WXNHeartbeat(double expected) {
     WXNCheckFreeze();
     double now = CFAbsoluteTimeGetCurrent();
+
+    if (expected > 0 && now - expected > 8.0) {
+        gLastFreezeAt = now;
+        gLastFreezeLen = now - expected;
+        WXN_ALOG(@"心跳迟到 %.0f 秒：这段时间进程被卡住/冻住过", now - expected);
+    }
+
+    BOOL frameAlive = WXNFrameAlive();
     WXN_ALOG(@"心跳 画面=%@（%.0f秒前刷过，共%ld帧） 触摸=%.0f秒 冻结=%.0f秒内 %.0f秒 场景 known=%d away=%d",
-             WXNFrameAlive() ? @"在刷" : @"停了",
+             frameAlive ? @"在刷" : @"停了",
              gFrameTicks > 0 ? now - gLastFrameAt : -1, gFrameTicks,
              gLastTouch > 0 ? now - gLastTouch : -1,
              gLastFreezeAt > 0 ? now - gLastFreezeAt : -1, gLastFreezeLen,
              (int)gSceneKnown, (int)gSceneAway);
+
+    double next = CFAbsoluteTimeGetCurrent() + 30.0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       WXNHeartbeat();
+                       WXNHeartbeat(next);
                    });
 }
 
@@ -1886,6 +1903,6 @@ static void WXNInit(void) {
     // 每 30 秒写一行，至少能证明进程还活着、场景信号有没有在动。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       WXNHeartbeat();
+                       WXNHeartbeat(0);
                    });
 }
