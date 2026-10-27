@@ -38,7 +38,7 @@
 #import <string.h>
 
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.4"
+#define WXN_VERSION     "2.5"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -813,25 +813,57 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
 // 我们不去改它（改了就没保活了），只在它抹之前看一眼：看到了，就说明人真的走了。
 // ---------------------------------------------------------------------------
 
-static void (*gOrigSetDeactReasons)(id, SEL, unsigned long long);
-static void (*gOrigUpdateSettings)(id, SEL, id, id, id);
+// 每个类各自保留原来的 IMP："类名|选择器" -> NSValue(IMP)
+// 不能只存一份，因为同一个选择器可能被好几个类各自实现，调用时得找回"这一个实例"的上一层。
+static NSMutableDictionary *gSceneOrig = nil;
+
+static NSString *WXNSelKey(Class c, SEL sel) {
+    return [NSString stringWithFormat:@"%s|%s", class_getName(c), sel_getName(sel)];
+}
+
+// 从实例的真实类往上找：谁是我们接管的，就返回它原来的 IMP
+static IMP WXNOrigFor(id self, SEL _cmd) {
+    Class c = object_getClass(self);
+    while (c) {
+        NSValue *v = [gSceneOrig objectForKey:WXNSelKey(c, _cmd)];
+        if (v) return (IMP)[v pointerValue];
+        c = class_getSuperclass(c);
+    }
+    return NULL;
+}
+
+static NSTimeInterval gLastSceneLogAt = 0;
 
 static void WXNNoteDeactReasons(unsigned long long r, NSString *where) {
+    BOOL changed = NO;
     if (r) {
-        if (!gSceneAway) WXN_ALOG(@"场景停用：reasons=0x%llx（%@）", r, where);
+        if (!gSceneAway) {
+            WXN_ALOG(@"场景停用：reasons=0x%llx（%@）", r, where);
+            changed = YES;
+        }
         gSceneAway = YES;
         gLastDeactReasons = r;
     } else {
-        if (gSceneAway) WXN_ALOG(@"场景恢复：reasons=0（%@）", where);
+        if (gSceneAway) {
+            WXN_ALOG(@"场景恢复：reasons=0（%@）", where);
+            changed = YES;
+        }
         gSceneAway = NO;
         gLastDeactReasons = 0;
     }
     gSceneKnown = YES;
+    // 值没变也要偶尔记一次，好让用户切完屏回来能看见"确实进过这里"
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (!changed && now - gLastSceneLogAt > 3.0) {
+        WXN_ALOG(@"场景回调：reasons=0x%llx（%@）", r, where);
+    }
+    gLastSceneLogAt = now;
 }
 
 static void WXNSetDeactReasons(id self, SEL _cmd, unsigned long long reasons) {
     @try { WXNNoteDeactReasons(reasons, @"setDeactivationReasons"); } @catch (__unused NSException *e) {}
-    if (gOrigSetDeactReasons) gOrigSetDeactReasons(self, _cmd, reasons);
+    IMP o = WXNOrigFor(self, _cmd);
+    if (o) ((void (*)(id, SEL, unsigned long long))o)(self, _cmd, reasons);
 }
 
 static void WXNUpdateSettings(id self, SEL _cmd, id settings, id ctx, id completion) {
@@ -842,21 +874,55 @@ static void WXNUpdateSettings(id self, SEL _cmd, id settings, id ctx, id complet
             WXNNoteDeactReasons(r, @"updateSettings");
         }
     } @catch (__unused NSException *e) {}
-    if (gOrigUpdateSettings) gOrigUpdateSettings(self, _cmd, settings, ctx, completion);
+    IMP o = WXNOrigFor(self, _cmd);
+    if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, settings, ctx, completion);
 }
 
+// 在运行时里把"自己实现了这个方法"的类全部接管。
+// 只认自己的方法列表（不认继承来的），这样每个类只挂一次，且子类实例调用时
+// WXNOrigFor 一路往上找一定能找到对应的原实现。
+static NSArray *WXNDeepSwizzle(NSString *selName, IMP replacement) {
+    NSMutableArray *names = [NSMutableArray array];
+    SEL sel = NSSelectorFromString(selName);
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return names;
+    for (unsigned int i = 0; i < count; i++) {
+        Class c = classes[i];
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        BOOL own = NO;
+        for (unsigned int j = 0; j < mc; j++) {
+            if (sel_isEqual(method_getName(ms[j]), sel)) { own = YES; break; }
+        }
+        free(ms);
+        if (!own) continue;
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        IMP cur = method_getImplementation(m);
+        if (cur == replacement) continue;              // 已经是我们的，别自己套自己
+        NSString *key = WXNSelKey(c, sel);
+        if (![gSceneOrig objectForKey:key]) {          // 只记最原始的那个 IMP
+            [gSceneOrig setObject:[NSValue valueWithPointer:cur] forKey:key];
+        }
+        method_setImplementation(m, replacement);
+        [names addObject:NSStringFromClass(c)];
+    }
+    free(classes);
+    return names;
+}
+
+// 可以反复调用：后来才加载的类、以及被别人又盖回去的方法，都会被重新接管
 static void WXNInstallSceneProbe(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        Class s1 = NSClassFromString(@"UIMutableApplicationSceneSettings");
-        if (s1) WXNSwizzle(s1, @"setDeactivationReasons:", (IMP)WXNSetDeactReasons, &gOrigSetDeactReasons);
-        Class s2 = NSClassFromString(@"FBScene");
-        if (s2) WXNSwizzle(s2, @"updateSettings:withTransitionContext:completion:",
-                          (IMP)WXNUpdateSettings, &gOrigUpdateSettings);
-        WXN_ALOG(@"场景停用探针：settings=%@ scene=%@",
-                 gOrigSetDeactReasons ? @"已挂" : @"没挂",
-                 gOrigUpdateSettings ? @"已挂" : @"没挂");
-    });
+    if (!gSceneOrig) gSceneOrig = [NSMutableDictionary dictionary];
+    NSArray *a = WXNDeepSwizzle(@"setDeactivationReasons:", (IMP)WXNSetDeactReasons);
+    NSArray *b = WXNDeepSwizzle(@"updateSettings:withTransitionContext:completion:",
+                                (IMP)WXNUpdateSettings);
+    if (a.count || b.count) {
+        WXN_ALOG(@"场景探针：本次接管 settings %lu 个[%@] scene %lu 个[%@]",
+                 (unsigned long)a.count, [a componentsJoinedByString:@","] ?: @"-",
+                 (unsigned long)b.count, [b componentsJoinedByString:@","] ?: @"-");
+    }
 }
 
 static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
@@ -1597,6 +1663,58 @@ static void WXNPostBootOnce(void) {
                    });
 }
 
+// 再补一层零风险的探针：只听系统广播，不改任何行为。
+// 如果连这些广播都被 Immortalizer 吃掉，日志里就一条都不会有；
+// 只要出现一条，就说明微信确实收到了"退到后台"的通知，可以直接拿它当判断依据。
+static NSMutableArray *gNoticeTokens = nil;
+
+static void WXNInstallAppNotices(void) {
+    if (!gNoticeTokens) gNoticeTokens = [NSMutableArray array];
+    NSArray *names = @[@"UIApplicationDidEnterBackgroundNotification",
+                       @"UIApplicationWillEnterForegroundNotification",
+                       @"UIApplicationWillResignActiveNotification",
+                       @"UIApplicationDidBecomeActiveNotification",
+                       @"UISceneDidEnterBackgroundNotification",
+                       @"UISceneWillEnterForegroundNotification",
+                       @"UISceneWillDeactivateNotification",
+                       @"UISceneDidActivateNotification"];
+    for (NSString *n in names) {
+        id token = [[NSNotificationCenter defaultCenter]
+            addObserverForName:n
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+                        BOOL away = [n containsString:@"EnterBackground"] ||
+                                    [n containsString:@"WillDeactivate"] ||
+                                    [n containsString:@"WillResignActive"];
+                        BOOL back = [n containsString:@"Foreground"] ||
+                                    [n containsString:@"DidActivate"] ||
+                                    [n containsString:@"DidBecomeActive"];
+                        WXN_ALOG(@"应用通知：%@（判为人已离开=%d）", n, (int)away);
+                        if (away || back) {
+                            gSceneKnown = YES;
+                            gSceneAway = away;
+                            gLastDeactReasons = away ? 0xFFFFFFFFull : 0;
+                        }
+                    }];
+        if (token) [gNoticeTokens addObject:token];
+    }
+    WXN_ALOG(@"应用通知探针：已监听 %lu 个广播", (unsigned long)gNoticeTokens.count);
+}
+
+// 心跳：每 30 秒一行。切到别的 App 时微信自己不会写任何日志，
+// 有了这行才能分清"插件没动静"和"微信整个进程被抓去沉眠了"。
+static void WXNHeartbeat(void) {
+    WXN_ALOG(@"心跳 场景 known=%d away=%d reasons=0x%llx 触摸=%.0f秒 锁屏=%d",
+             (int)gSceneKnown, (int)gSceneAway, (unsigned long long)gLastDeactReasons,
+             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
+             (int)WXNDeviceLocked());
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXNHeartbeat();
+                   });
+}
+
 __attribute__((constructor))
 static void WXNInit(void) {
     // 硬保险：不是微信就什么都不做。filter 里只写了 com.tencent.xin，
@@ -1625,6 +1743,7 @@ static void WXNInit(void) {
     });
 
     WXNInstallSceneProbe();
+    WXNInstallAppNotices();
     WXNInstallTouch();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
@@ -1632,6 +1751,7 @@ static void WXNInit(void) {
     // 用户那边跑不了命令，所以启动后自己写一份诊断到沙盒，并弹一条自检
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+                       WXNInstallSceneProbe();   // 被别人又盖回去的，重新接管一次
                        WXNSetupPresentationHooks();
                        WXNDumpReport();
                        WXNPostBootOnce();
@@ -1639,7 +1759,15 @@ static void WXNInit(void) {
     // 有些机器上 CMessageMgr 注册得很晚，20 秒再补一次
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+                       WXNInstallSceneProbe();
                        WXNSetupPresentationHooks();
                        WXNDumpReport();
+                   });
+
+    // 心跳：切到别的 App 时微信自己一条日志都不写，看上去就像“日志停在某分钟”。
+    // 每 30 秒写一行，至少能证明进程还活着、场景信号有没有在动。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXNHeartbeat();
                    });
 }
