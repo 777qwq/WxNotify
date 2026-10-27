@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.10"
+#define WXN_VERSION     "2.11"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 #define WXN_TEST_NOT    "cn.qwq.wxnotify.test"
@@ -97,6 +97,10 @@ static NSInteger gRealAppState = -1;   // 假装期间的真实状态
 static int gFakeBGGen = 0;
 static int gNativePosts = 0;  // 微信自己投递的通知条数
 static int gNativePostsAtStart = 0;
+
+// 2.11：假装后台的“余期”。willPresent 常常晚于 2.5 秒窗口才进来，
+// 所以把截止时间单独记一份，窗口过了也能认出“这条是刚翻出来的原生通知”。
+static double gFakeUntil = 0;
 
 
 static WXNConfig WXNConfigCopy(void) {
@@ -502,24 +506,15 @@ static BOOL WXNFrameAlive(void) {
     return (CFAbsoluteTimeGetCurrent() - gLastFrameAt) < 3.0;
 }
 
+// 2.11：画面探针在 Immortalizer 下永远在刷（进程根本不会被挂起，锁屏了还在刷 ——
+// 16:56:56 锁屏时报“0.4 秒前刷过”就是证据），拿它判断只能一直判成“在微信里”。
+// 改成只看手指：8 秒内摸过屏幕 = 人就在微信里；锁屏 / 久没摸 = 人不在。
 static BOOL WXNUserInWeChat(void) {
     double now = CFAbsoluteTimeGetCurrent();
 
-    // 刚被解冻：刚才那段时间进程是停摆的，人肯定不在微信里
-    if (gLastFreezeAt > 0 && now - gLastFreezeAt < 15.0) {
-        WXN_LOG(@"  刚冻结过 %.0f 秒，判为人不在微信", gLastFreezeLen);
-        return NO;
-    }
-    // 画面在刷 = 微信真的在屏幕上
-    if (WXNFrameAlive()) return YES;
-    // 探针能用但画面停了 = 被别的 App 盖住 / 锁屏
-    if (gFrameTicks > 0) {
-        WXN_LOG(@"  画面已停 %.0f 秒，判为人不在微信", now - gLastFrameAt);
-        return NO;
-    }
-    // 探针不可用，退回触摸
-    if (gLastTouch <= 0) return NO;
-    return (now - gLastTouch) < 20.0;
+    if (WXNDeviceLocked()) return NO;          // 锁屏了，肯定不在微信里
+    if (gLastTouch <= 0) return NO;            // 从没接到过触摸，当成不在
+    return (now - gLastTouch) < 8.0;
 }
 
 static BOOL WXNShouldNotify(void) {
@@ -1014,7 +1009,8 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
 
     // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
     if (!WXNShouldNotify()) {
-        WXN_ALOG(@"  跳过：微信就在屏幕上 state=%ld frontmost=%@",
+        WXN_ALOG(@"  跳过：人就在微信里（触摸 %.0f 秒前）state=%ld frontmost=%@",
+                 gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
                  (long)[UIApplication sharedApplication].applicationState,
                  WXNCurrentFrontmostBundle() ?: @"(未知)");
         return;
@@ -1264,16 +1260,19 @@ static BOOL WXNForcePresentation(void) {
 
 static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
                            void (^completion)(NSUInteger)) {
-    BOOL inWeChat = !gForceNextBanner && WXNUserInWeChat();
+    double now = CFAbsoluteTimeGetCurrent();
+    BOOL faked = (now < gFakeUntil);
+    BOOL inWeChat = !gForceNextBanner && !faked && WXNUserInWeChat();
 
     // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
     // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
-    // 人不在微信里 -> 给足横幅+声音+角标，别被 Immortalizer 那个开关吃掉。
-    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 强制=%d 画面=%.1f秒前刷过 触摸=%.1f秒前 冻结=%.1f秒前",
-             NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)gForceNextBanner,
-             gFrameTicks > 0 ? CFAbsoluteTimeGetCurrent() - gLastFrameAt : -1,
-             gLastTouch > 0 ? CFAbsoluteTimeGetCurrent() - gLastTouch : -1,
-             gLastFreezeAt > 0 ? CFAbsoluteTimeGetCurrent() - gLastFreezeAt : -1);
+    // 人不在微信里（或这条是我们刚翻出来的）-> 给足横幅+声音+角标。
+    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 刚翻的=%d 强制=%d 触摸=%.1f秒前 锁屏=%d 画面=%.1f秒前刷过",
+             NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)faked,
+             (int)gForceNextBanner,
+             gLastTouch > 0 ? now - gLastTouch : -1,
+             (int)WXNDeviceLocked(),
+             gFrameTicks > 0 ? now - gLastFrameAt : -1);
 
     if (inWeChat) {
         WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
@@ -1282,12 +1281,18 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
         return;
     }
 
-    // 这里千万不要带 Sound：系统在调 willPresent 就说明微信自己还活着，
-    // 它自己的提示音已经响过一遍了，再响一次就是双提示音。
     NSUInteger opts = UNNotificationPresentationOptionBanner |
                       UNNotificationPresentationOptionList |
                       UNNotificationPresentationOptionBadge;
-    WXN_ALOG(@"前台呈现 -> 强制横幅+角标（声音交给微信自己那一声）");
+    if (faked) {
+        // 微信以为自己在后台，它自己那一声根本不会响 —— 声音必须由这条通知出，
+        // 否则就是“有横幅没声音”。
+        opts |= UNNotificationPresentationOptionSound;
+        WXN_ALOG(@"前台呈现 -> 强制横幅+声音+角标（微信以为在后台，自己没响）");
+    } else {
+        // 没翻过：说明微信当时在前台，它自己的提示音已经响过，再加声音就是双响
+        WXN_ALOG(@"前台呈现 -> 强制横幅+角标（不重复出声）");
+    }
     if (completion) completion(opts);
 }
 
@@ -1720,6 +1725,7 @@ static void WXNBeginFakeBackground(NSString *why) {
     if (gLNIsBG) WXNDumpState(gLN, @"翻之后 MMLocalNotificationMgr");
 
     gFakeBG = YES;
+    gFakeUntil = CFAbsoluteTimeGetCurrent() + 6.0;   // willPresent 可能晚到，窗口单独放宽
     int gen = ++gFakeBGGen;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
