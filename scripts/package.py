@@ -168,6 +168,12 @@ def main():
             ver = l.split(":", 1)[1].strip()
     out = os.path.join(args.out, "%s_%s_iphoneos-arm64.deb" % (PACKAGE, ver))
 
+    # debian 维护脚本必须是可执行位，否则 dpkg-deb 直接报 bad permissions
+    for f in ("preinst", "postinst", "prerm", "postrm"):
+        p = os.path.join(args.root, "DEBIAN", f)
+        if os.path.exists(p):
+            os.chmod(p, 0o755)
+
     if shutil.which("dpkg-deb"):
         subprocess.check_call(["dpkg-deb", "--build", "--root-owner-group", args.root, out])
     else:

@@ -25,6 +25,7 @@ FILES = [
     ('scripts/push.py', 'scripts/push.py'),
     ('scripts/fetch.py', 'scripts/fetch.py'),
     ('README.md', 'README.md'),
+    ('.gitignore', '.gitignore'),
     ('build/DEBIAN/control', 'build/DEBIAN/control'),
     ('build/DEBIAN/postinst', 'build/DEBIAN/postinst'),
 ]
