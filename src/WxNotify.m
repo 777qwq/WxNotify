@@ -41,7 +41,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.30"
+#define WXN_VERSION     "2.31"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -941,20 +941,19 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
-    if (!WXNShouldNotify()) {
-        WXN_ALOG(@"  跳过：前台判断为“人在微信里”（认知后台=%d）", (int)WXNReadLNBG());
-        // 2.27：残留认知复位。Immortalizer 抹掉生命周期回调后，微信退后台
-        // 置上的 m_isInBackground=1 没人刷回 0，前台收消息它就以为自己还在
-        // 后台：app 内提示音被它自己跳过、改走 LN 链路（2.24 只好拦截）。
-        // 这里人真的在微信里，把认知往前台方向复位（安全方向，不是翻转），
-        // 让它整条原生链路自己跑：app 内横幅+声音归它，LN 不再发。
-        WXNCognitionRestore();
+    // 2.31：只有微信真退到后台才不干预（它自己会发）。其余情况——锁屏、
+    // 人在微信、人刚离开——一律走下面的假后台窗口把认知翻成 1：
+    // 8.0.80 实测“认知=0 时 LN 走到一半被微信自己掐掉，进不了 UN”，
+    // 提示音只从 UN 呈现链出，所以必须翻，翻完呈现层按“人是否真在微信”分流。
+    UIApplication *app = [UIApplication sharedApplication];
+    NSInteger stNow = gFakeBG ? gRealAppState : (app ? app.applicationState : -1);
+    if (stNow == UIApplicationStateBackground) {
+        WXN_ALOG(@"  跳过：微信真退到后台，通知它自己会发");
         return;
     }
 
-    // 人不在微信里：真正要投递之前再翻它的认知（见 WXNBeginFakeBackground），
-    // 因为这里之后还可能因为“自己发的/免打扰/太旧/重复”而跳过
+    // 后面继续走统一管线：isSender/去重过滤后开假后台窗口（见 WXNBeginFakeBackground），
+    // 无论人在不在微信都翻认知——LN 必须进 UN，呈现交给 willPresent 分流
 
     // 自己发出去的消息不提醒
     Class wrapCls = NSClassFromString(@"CMessageWrap");
@@ -1206,11 +1205,12 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
     double now = CFAbsoluteTimeGetCurrent();
     BOOL faked = (now < gFakeUntil);
     NSString *why = nil;
-    BOOL inWeChat = !gForceNextBanner && !faked && WXNInWeChatSafe(&why);
+    // 2.31：按“人是否真在微信”分流，不再被 faked 压过——人回到微信了就该只响，
+    // 顺带把 6 秒余期造成的“回微信还弹横幅”尾巴一起收掉。
+    BOOL inWeChat = !gForceNextBanner && WXNInWeChatSafe(&why);
 
-    // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
-    // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
-    // 人不在微信里（或这条是我们刚翻出来的）-> 给足横幅+声音+角标。
+    // 人在微信里 -> 只还声音（8.0.80 提示音在通知链上，横幅不给）；
+    // 人不在微信里 -> 给足横幅+声音+角标。
     WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 刚翻的=%d 强制=%d（%@）",
              NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)faked,
              (int)gForceNextBanner, why ?: @"(无)");
