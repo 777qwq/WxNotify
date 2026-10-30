@@ -1247,6 +1247,17 @@ static void WXNHookDelegateClass(Class cls) {
 
     BOOL ok = WXNSwizzle(cls, @"userNotificationCenter:willPresentNotification:withCompletionHandler:",
                          (IMP)WXNWillPresent, &gOrigWillPresent);
+    if (!ok) {
+        // 2.24：代理类压根没实现 willPresent（8.0.80 可能换了实现方式）时，
+        // swizzle 无从下手、系统走默认呈现，原生横幅照样漏。
+        // 往类上加一份我们的实现兜底——加在子类上不影响父类其他使用者。
+        SEL sel = NSSelectorFromString(@"userNotificationCenter:willPresentNotification:withCompletionHandler:");
+        if (!class_getInstanceMethod(cls, sel) &&
+            class_addMethod(cls, sel, (IMP)WXNWillPresent, "v@:@@@?")) {
+            ok = YES;
+            WXN_ALOG(@"通知代理 %@ 没有 willPresent，已加方法兜底", name);
+        }
+    }
     WXN_ALOG(@"通知代理 %@ 的前台呈现钩子：%@", name, ok ? @"已挂" : @"无此方法");
 }
 
@@ -1472,12 +1483,25 @@ static void WXNLNInit(id self, SEL _cmd) {
     if (gOrigLNInit) gOrigLNInit(self, _cmd);
 }
 
+static void WXNEndFakeBackground(NSString *why);   // 定义在后面，2.24 前台拦截用
+
 static void WXNLNShowPush3(id self, SEL _cmd, id wrap, id ident, id fireDate,
                            BOOL voip, BOOL silent) {
     WXNGrabLN(self);
     if (gFakeBG) WXNCognitionForce(YES);
     WXN_ALOG(@"微信要发本地推送（全参数）voip=%d silent=%d 认知后台=%d id=%@",
              (int)voip, (int)silent, (int)WXNReadLNBG(), ident);
+
+    // 2.24：从探针升级为决策点。
+    // 人在微信里时，原生前台行为本来就不该弹系统横幅——以前全靠 willPresent
+    // 静默兜底，代理接管一旦失败（8.0.80 换代理类）原生横幅就漏出来，
+    // 单横幅裸奔/双横幅都从这里来。在这里吞掉，与 delegate 状态彻底解耦。
+    // voip 放行：来电提醒走微信自己的 CallKit 链路，不能掐。
+    if (!voip && WXNInWeChatSafe(NULL)) {
+        WXN_ALOG(@"前台拦截 -> 人在微信里，吞掉原生本地推送（id=%@）", ident);
+        if (gFakeBG) WXNEndFakeBackground(@"前台拦截");
+        return;
+    }
     if (gOrigLNShowPush3) gOrigLNShowPush3(self, _cmd, wrap, ident, fireDate, voip, silent);
 }
 
