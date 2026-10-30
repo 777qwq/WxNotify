@@ -902,6 +902,8 @@ static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle
 
 // where 是命中的钩子名，日志里靠它判断到底是哪条链路把消息送上来的
 static void WXNBeginFakeBackground(NSString *why);   // 定义在后面
+static BOOL WXNReadLNBG(void);                       // 2.27 残留认知复位用
+static void WXNCognitionRestore(void);
 
 static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
     if (!wrap) {
@@ -931,7 +933,13 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
 
     // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
     if (!WXNShouldNotify()) {
-        WXN_ALOG(@"  跳过：前台判断为“人在微信里”");
+        WXN_ALOG(@"  跳过：前台判断为“人在微信里”（认知后台=%d）", (int)WXNReadLNBG());
+        // 2.27：残留认知复位。Immortalizer 抹掉生命周期回调后，微信退后台
+        // 置上的 m_isInBackground=1 没人刷回 0，前台收消息它就以为自己还在
+        // 后台：app 内提示音被它自己跳过、改走 LN 链路（2.24 只好拦截）。
+        // 这里人真的在微信里，把认知往前台方向复位（安全方向，不是翻转），
+        // 让它整条原生链路自己跑：app 内横幅+声音归它，LN 不再发。
+        WXNCognitionRestore();
         return;
     }
 
