@@ -1509,7 +1509,7 @@ static void WXNInstallLocalNotificationProbe(void) {
         Method m1 = class_getInstanceMethod(c, NSSelectorFromString(@"showPushWithMessageWrap:identifier:fireDate:isFromVoipPush:shouldSilent:"));
         if (m1) {
             char *rt = method_copyReturnType(m1);
-            WXN_ALOG(@"[类型侦察] showPush3 返回类型=%s", rt ?: @"?");
+            WXN_ALOG(@"[类型侦察] showPush3 返回类型=%s", (rt ? rt : "?"));
             free(rt);
         }
     }
@@ -1652,7 +1652,7 @@ static BOOL WXNInstall(void) {
         IMP orig = method_getImplementation(m);
         if (orig != (IMP)WXNMsgHook2) {
             char *rt = method_copyReturnType(m);
-            WXN_ALOG(@"已挂 %@ 返回类型=%s", name, rt ?: @"?");
+            WXN_ALOG(@"已挂 %@ 返回类型=%s", name, (rt ? rt : "?"));
             free(rt);
             gOrigMap[name] = [NSValue valueWithPointer:orig];
             method_setImplementation(m, (IMP)WXNMsgHook2);
@@ -1666,7 +1666,7 @@ static BOOL WXNInstall(void) {
         Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(three));
         if (m3) {
             char *rt = method_copyReturnType(m3);
-            WXN_ALOG(@"[类型侦察] %@ 返回类型=%s", three, rt ?: @"?");
+            WXN_ALOG(@"[类型侦察] %@ 返回类型=%s", three, (rt ? rt : "?"));
             free(rt);
         }
     }
