@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.29"
+#define WXN_VERSION     "2.30"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1620,6 +1620,65 @@ static BOOL gWasInWeChat = NO;
 
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
+// 2.30：未读数侦察——找微信内部"总未读"的真实来源，
+// 给角标跟未读同步做证据。只在 debug 开时跑一次。
+static void WXNDiagUnread(void) {
+    @autoreleasepool {
+        Class mgr = NSClassFromString(@"CMessageMgr");
+        if (!mgr) { WXN_ALOG(@"[未读侦察] 没有 CMessageMgr"); return; }
+        id center = WXNServiceCenter();
+        id inst = nil;
+        if (center && [center respondsToSelector:@selector(getService:)]) {
+            @try { inst = ((id (*)(id, SEL, Class))objc_msgSend)(center, @selector(getService:), mgr); }
+            @catch (__unused NSException *e) { inst = nil; }
+        }
+        WXN_ALOG(@"[未读侦察] 实例=%@", inst ? NSStringFromClass(object_getClass(inst)) : @"nil");
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(mgr, &n);
+        NSMutableArray *hits = [NSMutableArray array];
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *name = NSStringFromSelector(method_getName(ms[i]));
+            NSString *low = name.lowercaseString;
+            if ([low containsString:@"unread"] || [low containsString:@"nread"]) [hits addObject:name];
+        }
+        free(ms);
+        WXN_ALOG(@"[未读侦察] CMessageMgr 方法命中 %lu 个：%@", (unsigned long)hits.count,
+                 WXNTrim([hits componentsJoinedByString:@", "], 600) ?: @"(无)");
+        if (!inst) { WXN_ALOG(@"[未读侦察] 没有实例，ivar 与试调跳过"); return; }
+        unsigned int iv = 0;
+        Ivar *ivs = class_copyIvarList(mgr, &iv);
+        NSMutableArray *ihits = [NSMutableArray array];
+        for (unsigned int i = 0; i < iv; i++) {
+            const char *nm = ivar_getName(ivs[i]);
+            if (!nm) continue;
+            NSString *name = @(nm);
+            NSString *low = name.lowercaseString;
+            if ([low containsString:@"unread"] || [low containsString:@"nread"]) {
+                id v = object_getIvar(inst, ivs[i]);
+                [ihits addObject:[NSString stringWithFormat:@"%@=%@", name, v ?: @"nil"]];
+            }
+        }
+        free(ivs);
+        WXN_ALOG(@"[未读侦察] ivar 命中 %lu 个：%@", (unsigned long)ihits.count,
+                 WXNTrim([ihits componentsJoinedByString:@", "], 600) ?: @"(无)");
+        // 试调无参、名字像取数的
+        for (NSString *name in hits) {
+            if ([name containsString:@":"]) continue;
+            SEL sel = NSSelectorFromString(name);
+            if (![inst respondsToSelector:sel]) continue;
+            NSMethodSignature *sig = [inst methodSignatureForSelector:sel];
+            if (sig.numberOfArguments != 2) continue;
+            const char *rt = [sig methodReturnType];
+            if (rt[0] == 'Q' || rt[0] == 'q' || rt[0] == 'I' || rt[0] == 'i' || rt[0] == 'l') {
+                long long v = 0;
+                if (rt[0] == 'Q' || rt[0] == 'I') v = (long long)((unsigned long (*)(id, SEL))objc_msgSend)(inst, sel);
+                else v = ((long long (*)(id, SEL))objc_msgSend)(inst, sel);
+                WXN_ALOG(@"[未读侦察] 试调 %@ -> %lld", name, v);
+            }
+        }
+    }
+}
+
 static void WXNWatchFront(void) {
     @try {
         NSString *why = nil;
@@ -1984,6 +2043,7 @@ static void WXNInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNTryGrabLN(@"启动 20 秒");
+                       if (WXNDebug()) WXNDiagUnread();
                        WXNSetupPresentationHooks();
                    });
 }
