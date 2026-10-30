@@ -28,7 +28,6 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CADisplayLink.h>
 #import <UserNotifications/UserNotifications.h>
-#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -41,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.31"
+#define WXN_VERSION     "2.22"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -62,6 +61,7 @@ typedef struct {
     BOOL sound;        // 播放提示音
     BOOL respectMute;  // 尊重微信的会话免打扰
     BOOL avatar;       // 用系统通讯通知显示发送者头像
+    BOOL fallback;     // 微信没自己发的时候，由我们补一条。2.20 起默认关
     BOOL debug;        // 打日志
 } WXNConfig;
 
@@ -104,7 +104,7 @@ static NSString *WXNLogPath(void) {
         NSMutableArray *cands = [NSMutableArray array];
 
         NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *tmp = NSTemporaryDirectory();   // 2.29：放微信沙盒 tmp/，不占 Documents
+        NSString *tmp = NSTemporaryDirectory();   // 2.22：放微信沙盒 tmp/，系统会自动清
         if (tmp.length) [cands addObject:[tmp stringByAppendingPathComponent:@"wxnotify.log"]];
         if (docs.count) [cands addObject:[docs[0] stringByAppendingPathComponent:@"wxnotify.log"]];
         [cands addObject:@"/var/mobile/Library/Preferences/wxnotify.log"];
@@ -120,17 +120,16 @@ static NSString *WXNLogPath(void) {
     return path;
 }
 
-#define WXN_LOG_MAX  (30 * 1024)   // 2.29：日志上限 30KB，超了清空重写
+#define WXN_LOG_MAX  (50 * 1024)   // 2.22：日志上限 50KB，超了清空重写
 
 static void WXNLog(NSString *fmt, ...) {
-    // 2.29：日志默认开（plist debug=false 或删掉标记文件可关）。
+    // 2.22：日志默认开（plist debug=false 或删标记文件可关）；超 50KB 清空重写
     if (!WXNDebug()) return;
 
-    // 超限就清空：日志只留最近的，不为排查历史背 30KB 以上的体积
     NSString *lp = WXNLogPath();
     if (lp) {
-        NSDictionary *st = [[NSFileManager defaultManager] attributesOfItemAtPath:lp error:NULL];
-        if (st && [st fileSize] > WXN_LOG_MAX) [[NSFileManager defaultManager] removeItemAtPath:lp error:NULL];
+        NSDictionary *st2 = [[NSFileManager defaultManager] attributesOfItemAtPath:lp error:NULL];
+        if (st2 && [st2 fileSize] > WXN_LOG_MAX) [[NSFileManager defaultManager] removeItemAtPath:lp error:NULL];
     }
 
     va_list ap;
@@ -188,15 +187,18 @@ static void WXNLoadConfig(void) {
     c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
     c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : YES;
     c.avatar      = d[@"avatar"]      ? [d[@"avatar"] boolValue]      : NO;
-    // 2.29：日志默认开。想关：plist 里 debug=false（标记文件机制保留兼容）
+    // 2.20：补发默认关。只让微信自己那条通知出去，避免"我们投一条、
+    // 它又投一条"把横幅顶成先收回再弹出。想恢复补发写 fallback=true。
+    c.fallback = d[@"fallback"] ? [d[@"fallback"] boolValue] : NO;
+    // 日志默认关。想开：plist 里 debug=true，或者放一个空文件
     // /var/mobile/Library/Preferences/cn.qwq.wxnotify.debug（Filza 里新建就行）
     if (d[@"debug"]) c.debug = [d[@"debug"] boolValue];
-    else c.debug = YES;   // 2.29：日志默认开（plist 里 debug=false 可关）
+    else c.debug = YES;   // 2.22：日志默认开（plist debug=false 可关）
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
-    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d debug=%d",
-            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.debug);
+    WXN_LOG(@"config enabled=%d showContent=%d sound=%d respectMute=%d avatar=%d native=%d debug=%d",
+            c.enabled, c.showContent, c.sound, c.respectMute, c.avatar, c.fallback, c.debug);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +869,7 @@ static void WXNPost(NSString *identifier, NSString *title, NSString *subtitle, N
              }];
 }
 
-// 原生优先：只让微信自己发，本插件不再补发
+// 原生优先：先让微信自己发，它不发我们再补
 // ---------------------------------------------------------------------------
 // 场景停用信号
 //
@@ -889,11 +891,15 @@ static NSTimeInterval gLastSceneLogAt = 0;
 // 可以反复调用：后来才加载的类、以及被别人又盖回去的方法，都会被重新接管
 static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle, NSString *body,
                        NSString *thread, NSString *senderUsr, BOOL isGroup) {
-    // 2.22：补发整体移除。横幅一律由微信自己的通知链路出，
-    // 本插件只负责认知翻转 + willPresent 呈现接管；
-    // 微信晚了就晚了，宁可漏一条，不再自己补（补了就会双横幅互相顶）。
+    WXNConfig c = WXNConfigCopy();
+
     if (!gFakeBG) {
-        // 微信当时真的在后台，它自己会发，不插手
+        // 微信当时真的在后台，它自己会发，补发关了就不插手
+        if (!c.fallback) {
+            WXN_ALOG(@"补发已关闭，这条交给微信自己（%@）", identifier);
+            return;
+        }
+        WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
         return;
     }
     int base = gNativePostsAtStart;
@@ -901,19 +907,22 @@ static void WXNDeliver(NSString *identifier, NSString *title, NSString *subtitle
                    dispatch_get_main_queue(), ^{
         int now = gNativePosts;
         if (now > base) {
-            WXN_ALOG(@"微信自己发了 %d 条通知（%@）", now - base, identifier);
+            WXN_ALOG(@"微信自己发了 %d 条通知，本次不再补发", now - base);
             WXNEndFakeBackground(@"交给微信");
             return;
         }
         WXNEndFakeBackground(@"微信没发");
-        WXN_ALOG(@"微信 1.2 秒内没自己发，不补发，这条不出横幅（%@）", identifier);
+        if (!c.fallback) {
+            WXN_ALOG(@"微信没有自己发，补发已关闭，这条不出横幅");
+            return;
+        }
+        WXN_ALOG(@"微信没有自己发，改由本插件补发");
+        WXNPost(identifier, title, subtitle, body, thread, senderUsr, isGroup);
     });
 }
 
 // where 是命中的钩子名，日志里靠它判断到底是哪条链路把消息送上来的
 static void WXNBeginFakeBackground(NSString *why);   // 定义在后面
-static BOOL WXNReadLNBG(void);                       // 2.27 残留认知复位用
-static void WXNCognitionRestore(void);
 
 static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
     if (!wrap) {
@@ -941,19 +950,14 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    // 2.31：只有微信真退到后台才不干预（它自己会发）。其余情况——锁屏、
-    // 人在微信、人刚离开——一律走下面的假后台窗口把认知翻成 1：
-    // 8.0.80 实测“认知=0 时 LN 走到一半被微信自己掐掉，进不了 UN”，
-    // 提示音只从 UN 呈现链出，所以必须翻，翻完呈现层按“人是否真在微信”分流。
-    UIApplication *app = [UIApplication sharedApplication];
-    NSInteger stNow = gFakeBG ? gRealAppState : (app ? app.applicationState : -1);
-    if (stNow == UIApplicationStateBackground) {
-        WXN_ALOG(@"  跳过：微信真退到后台，通知它自己会发");
+    // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
+    if (!WXNShouldNotify()) {
+        WXN_ALOG(@"  跳过：前台判断为“人在微信里”");
         return;
     }
 
-    // 后面继续走统一管线：isSender/去重过滤后开假后台窗口（见 WXNBeginFakeBackground），
-    // 无论人在不在微信都翻认知——LN 必须进 UN，呈现交给 willPresent 分流
+    // 人不在微信里：真正要投递之前再翻它的认知（见 WXNBeginFakeBackground），
+    // 因为这里之后还可能因为“自己发的/免打扰/太旧/重复”而跳过
 
     // 自己发出去的消息不提醒
     Class wrapCls = NSClassFromString(@"CMessageWrap");
@@ -1010,7 +1014,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    WXN_ALOG(@"  命中，交给微信原生链路 session=%@", session);
+    WXN_ALOG(@"  准备补发 session=%@", session);
 
     unsigned int localID = WXNUInt(wrap, @"m_uiMesLocalID");
     long long svrID = WXNLongLong(wrap, @"m_n64MesSvrID");
@@ -1205,23 +1209,19 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
     double now = CFAbsoluteTimeGetCurrent();
     BOOL faked = (now < gFakeUntil);
     NSString *why = nil;
-    // 2.31：按“人是否真在微信”分流，不再被 faked 压过——人回到微信了就该只响，
-    // 顺带把 6 秒余期造成的“回微信还弹横幅”尾巴一起收掉。
-    BOOL inWeChat = !gForceNextBanner && WXNInWeChatSafe(&why);
+    BOOL inWeChat = !gForceNextBanner && !faked && WXNInWeChatSafe(&why);
 
-    // 人在微信里 -> 只还声音（8.0.80 提示音在通知链上，横幅不给）；
-    // 人不在微信里 -> 给足横幅+声音+角标。
+    // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
+    // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
+    // 人不在微信里（或这条是我们刚翻出来的）-> 给足横幅+声音+角标。
     WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 刚翻的=%d 强制=%d（%@）",
              NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)faked,
              (int)gForceNextBanner, why ?: @"(无)");
 
     if (inWeChat) {
-        // 2.30：8.0.7x 把 app 内提示音搬进了通知呈现链——原生行为靠微信自己的
-        // delegate 在这里给 Sound 选项。接管后给 None 等于把这声掐了。
-        // 只还声音不给横幅（Banner/List 不给），角标照旧回滚。
-        WXN_ALOG(@"前台呈现 -> 人在微信里，只还声音");
-        WXNBadgeRollback(@"前台只响");
-        if (completion) completion(UNNotificationPresentationOptionSound);
+        WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
+        WXNBadgeRollback(@"前台静默");
+        if (completion) completion(UNNotificationPresentationOptionNone);
         return;
     }
 
@@ -1280,9 +1280,14 @@ static void WXNHookDelegateClass(Class cls) {
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
-    // 2.23：与被接管的原生代理走同一段逻辑（去重/防重）。
-    // 之前这里是简化版、没有去重——代理在岗时第二条横幅永远压不掉。
-    WXNWillPresent(self, _cmd, center, notification, completionHandler);
+    NSUInteger opts = UNNotificationPresentationOptionNone;
+    if (WXNForcePresentation()) {
+        opts = UNNotificationPresentationOptionBanner |
+               UNNotificationPresentationOptionList |
+               UNNotificationPresentationOptionSound |
+               UNNotificationPresentationOptionBadge;
+    }
+    if (completionHandler) completionHandler(opts);
 }
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
@@ -1853,7 +1858,7 @@ static void WXNPostBootOnce(void) {
                                     [[NSUUID UUID] UUIDString]],
                                    [NSString stringWithFormat:@"WxNotify %s 已加载", WXN_VERSION],
                                    nil,
-                                   [NSString stringWithFormat:@"第 %d 条。收到消息会弹横幅。日志：%@",
+                                   [NSString stringWithFormat:@"第 %d 条。收到消息会补发横幅。日志：%@",
                                     i + 1, where],
                                    @"wxn-boot", nil, NO);
                        });
@@ -2068,6 +2073,8 @@ static void WXNFrontSetInterval(BOOL locked, BOOL fireSoon) {
                               iv, 200ull * NSEC_PER_MSEC);
 }
 
+static void WXNFrontTick(void);
+
 static void WXNFrontRun(void) {
     if (gFrontBusy) {
         if (++gFrontHangs > 4 && gFrontTimer) {
@@ -2134,6 +2141,7 @@ static void WXNFrontStart(void) {
     });
 }
 
+// 心跳：每 30 秒一行，看清「前台状态文件说的是谁」。
 __attribute__((constructor))
 static void WXNInit(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
