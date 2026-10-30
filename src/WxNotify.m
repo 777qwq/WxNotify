@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.31"
+#define WXN_VERSION     "2.32"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1373,9 +1373,17 @@ static void WXNTryGrabLN(NSString *why) {
 }
 
 // 微信向服务容器要东西的时候顺手看一眼，正好给它时就抓住
+static id gMsgMgr = nil;   // 2.32：CMessageMgr 真身（角标同步用）
+
 static id WXNGetServiceHook(id self, SEL _cmd, Class cls) {
     id svc = gOrigGetService ? gOrigGetService(self, _cmd, cls) : nil;
     if (svc && cls == NSClassFromString(@"MMLocalNotificationMgr")) WXNGrabLN(svc);
+    // 2.32：微信自己来拿 CMessageMgr 时顺手抓真身（getService 会给包装对象，
+    // 直接调拿不到能响应 GetUnReadCount 的实例）
+    if (svc && cls == NSClassFromString(@"CMessageMgr") && gMsgMgr != svc) {
+        gMsgMgr = svc;
+        WXN_ALOG(@"[角标同步] 抓到 CMessageMgr 真身：%@", NSStringFromClass(object_getClass(svc)));
+    }
     return svc;
 }
 
@@ -1639,13 +1647,7 @@ static BOOL gWasInWeChat = NO;
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
 // 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
 static NSInteger WXNUnreadTotal(void) {
-    Class mgr = NSClassFromString(@"CMessageMgr");
-    if (!mgr) return -1;
-    id center = WXNServiceCenter();
-    if (!center || ![center respondsToSelector:@selector(getService:)]) return -1;
-    id inst = nil;
-    @try { inst = ((id (*)(id, SEL, Class))objc_msgSend)(center, @selector(getService:), mgr); }
-    @catch (__unused NSException *e) { return -1; }
+    id inst = gMsgMgr;
     if (!inst || ![inst respondsToSelector:@selector(GetUnReadCount)]) return -1;
     @try {
         return (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(inst, @selector(GetUnReadCount));
