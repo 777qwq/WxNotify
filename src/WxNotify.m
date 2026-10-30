@@ -1554,6 +1554,9 @@ static void WXNSetupPresentationHooks(void) {
     }
 }
 
+static IMP gOrigUnReadChange;   // 2.31
+static void WXNUnReadChangeHook(id self, SEL _cmd, id a1);
+
 static BOOL WXNInstall(void) {
     Class cls = NSClassFromString(@"CMessageMgr");
     if (!cls) return NO;
@@ -1635,8 +1638,6 @@ static BOOL gWasInWeChat = NO;
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
 // 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
-static IMP gOrigUnReadChange;
-
 static NSInteger WXNUnreadTotal(void) {
     Class mgr = NSClassFromString(@"CMessageMgr");
     if (!mgr) return -1;
@@ -1764,9 +1765,6 @@ static void WXNWatchFront(void) {
 }
 
 // 类可能比 dylib 的 constructor 晚就绪，最多重试 20 次（约 10 秒）
-static IMP gOrigUnReadChange;   // 2.31 前向声明（定义在未读侦察段）
-static void WXNUnReadChangeHook(id self, SEL _cmd, id a1);
-
 static void WXNInstallWithRetry(int attempt) {
     if (WXNInstall()) {
         // 微信可能在启动后才设置通知代理，跟着多试几次
