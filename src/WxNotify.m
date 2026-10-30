@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.27"
+#define WXN_VERSION     "2.28"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -48,18 +48,7 @@
 // 2.12：SpringBoard 侧守卫写的真·最前台状态
 #define WXN_FRONT_PATH  "/var/mobile/Library/Preferences/cn.qwq.wxnotify.front"
 
-// 2.27：诊断分体开关——Preferences 下放对应空文件就跳过那组钩子，
-// 用于二分定位“微信内无声”的肇事钩子组；删文件+注销即恢复全量。
-static BOOL WXNMarkerOff(const char *tag) {
-    static char cache[8][64]; static BOOL val[8]; static int n=0;
-    for (int i=0;i<n;i++) if (!strcmp(cache[i],tag)) return val[i];
-    char path[128];
-    snprintf(path,sizeof(path),"\/var\/mobile\/Library\/Preferences\/cn.qwq.wxnotify.%s",tag);
-    BOOL off = [[NSFileManager defaultManager] fileExistsAtPath:@(path)];
-    if (n<8){ strncpy(cache[n],tag,63); val[n]=off; n++; }
-    if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
-    return off;
-}
+
 
 // 通知里显示的内容上限，防止超长消息把横幅撑爆
 #define WXN_BODY_MAX    240
@@ -1602,7 +1591,6 @@ static void WXNAddRequest(id self, SEL _cmd, id req, id handler) {
 }
 
 static void WXNSetupPresentationHooks(void) {
-    if (WXNMarkerOff("no_delegate")) return;   // 2.27 诊断分体
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
     if (!center) return;
 
@@ -1697,26 +1685,6 @@ static double gEnteredWeChatAt = 0;
 
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
-// 只在 debug 打开时探，两分钟最多一条，别刷屏。
-static double gLastProbeAt = 0;
-
-static void WXNProbeOnLeave(void) {
-    if (!WXNDebug()) return;
-    double now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastProbeAt < 120.0) return;
-    gLastProbeAt = now;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        WXN_ALOG(@"探针：人已离开微信，投一条测试通知，看横幅画不画得出来");
-        // 走和真实消息一样的路（翻认知 → 投递），所以它会响，不会静悄悄飘过去
-        WXNBeginFakeBackground(@"前台探针");
-        WXNPost([@"wxn-probe-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
-                @"前台探针", nil,
-                @"看到这条横幅，说明离开微信后能弹了。",
-                @"wxn-probe", nil, NO);
-    });
-}
-
 static void WXNWatchFront(void) {
     @try {
         NSString *why = nil;
@@ -1728,7 +1696,6 @@ static void WXNWatchFront(void) {
                 gEnteredWeChatAt = CFAbsoluteTimeGetCurrent();
                 WXNClearBadgeNow(@"回到微信", YES);
             } else {
-                WXNProbeOnLeave();
             }
         }
         if (in) {
@@ -1776,40 +1743,7 @@ static void WXNSetupWithRetry(int attempt) {
 //   notifyutil -p cn.qwq.wxnotify.test
 // ---------------------------------------------------------------------------
 
-// 诊断：notifyutil -p cn.qwq.wxnotify.diag
-// 把环境、钩子、权限、Immortalizer 开关全写进日志文件
-static void WXNPostBootOnce(void) {
-    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    if (!docs.count) return;
-    NSString *marker = [docs[0] stringByAppendingPathComponent:
-                                   [@".wxn_boot_" stringByAppendingString:@WXN_VERSION]];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:marker]) return;
-    if (![@"1" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL]) return;
 
-    gForceNextBanner = YES;
-    NSString *where = WXNLogPath() ?: @"(日志没写成功)";
-    WXN_ALOG(@"首次启动，投一条自检通知：%@", where);
-
-    // 两条间隔 2 秒：一条在微信里（走 willPresent 强制），一条应当直接当普通通知弹
-    for (int i = 0; i < 2; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-                           WXNPost([NSString stringWithFormat:@"wxn-boot-%d-%@", i,
-                                    [[NSUUID UUID] UUIDString]],
-                                   [NSString stringWithFormat:@"WxNotify %s 已加载", WXN_VERSION],
-                                   nil,
-                                   [NSString stringWithFormat:@"第 %d 条。收到消息会补发横幅。日志：%@",
-                                    i + 1, where],
-                                   @"wxn-boot", nil, NO);
-                       });
-    }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                       gForceNextBanner = NO;
-                   });
-}
 
 // 再补一层零风险的探针：只听系统广播，不改任何行为。
 // 注意：只有“离开”类广播才算证据（known=1），回来类广播满天飞（启动时就一堆），
@@ -2106,31 +2040,30 @@ static void WXNInit(void) {
         WXNLoadConfig();
     });
 
-    if (!WXNMarkerOff("no_ln")) WXNInstallLocalNotificationProbe();
-    if (!WXNMarkerOff("no_cog")) WXNInstallCognitionHooks();
+    WXNInstallLocalNotificationProbe();
+    WXNInstallCognitionHooks();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(__unused NSNotification *note) {
-        if (!WXNMarkerOff("no_badgeclear")) WXNClearBadgeNow(@"微信变成 active", YES);
+        WXNClearBadgeNow(@"微信变成 active", YES);
     }];
     WXNWatchFront();
-    if (!WXNMarkerOff("no_msg")) WXNInstallWithRetry(0);
-    if (!WXNMarkerOff("no_delegate")) WXNSetupWithRetry(0);
+    WXNInstallWithRetry(0);
+    WXNSetupWithRetry(0);
 
     // 8 秒补挂一次：有的版本类注册得晚，或者被别的插件盖回去了。
     // 自检通知只在这里、且只在 debug 打开时弹，日常版本一条都不弹。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       if (!WXNMarkerOff("no_cog")) WXNInstallCognitionHooks();
-                       if (!WXNMarkerOff("no_delegate")) WXNSetupPresentationHooks();
-                       if (WXNDebug()) WXNPostBootOnce();
+                       WXNInstallCognitionHooks();
+                       WXNSetupPresentationHooks();
                    });
 
     // 20 秒再补一次，顺便把可能还没起来的 MMLocalNotificationMgr 抓到手
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNTryGrabLN(@"启动 20 秒");
-                       if (!WXNMarkerOff("no_delegate")) WXNSetupPresentationHooks();
+                       WXNSetupPresentationHooks();
                    });
 }
