@@ -28,7 +28,6 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CADisplayLink.h>
 #import <UserNotifications/UserNotifications.h>
-#import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -1487,13 +1486,13 @@ static void WXNLNInit(id self, SEL _cmd) {
 
 static void WXNEndFakeBackground(NSString *why);   // 定义在后面，2.24 前台拦截用
 
-// 2.25：前台拦截后的本机提示。假后台窗口里微信以为自己不在前台、不会出
-// app 内提示音，以前那声是 willPresent 的 Sound 选项补的；推送被 2.24 吞掉
-// 后提示也跟着没了——横幅继续压，响铃+震动在这里自己接过来。
+// 2.26：声音改走 AudioServices（和震动同一条系统通道）。
+// 2.25 的 AVAudioPlayer 在微信进程里哑火（音频会话被微信占着），
+// 震动能出去说明 AudioServices 这条路是通的，声音也换到这条路上。
 static void WXNPlayInAppAlert(BOOL silent) {
     if (silent) return;
     AudioServicesPlaySystemSound(4095);   // kSystemSoundID_Vibrate（iPad 无震动，无害）
-    static AVAudioPlayer *player;
+    static SystemSoundID cachedTone = 0;
     NSString *tone = WXNToneName();
     NSString *path = nil;
     if (tone.length) {
@@ -1501,12 +1500,18 @@ static void WXNPlayInAppAlert(BOOL silent) {
         path = [[lib stringByAppendingPathComponent:@"Sounds"] stringByAppendingPathComponent:tone];
     }
     if (path.length) {
-        @try {
-            player = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:NULL];
-            if (player) { [player play]; return; }
-        } @catch (__unused NSException *e) {}
+        if (!cachedTone) {
+            NSURL *url = [NSURL fileURLWithPath:path];
+            SystemSoundID sid = 0;
+            OSStatus st = AudioServicesCreateSystemSoundID((__bridge CFURLRef)url, &sid);
+            if (st == noErr && sid) cachedTone = sid;
+        }
+        if (cachedTone) {
+            AudioServicesPlaySystemSound(cachedTone);
+            return;
+        }
     }
-    WXN_ALOG(@"前台提示：没有可用音色，只震了");
+    WXN_ALOG(@"前台提示：音色注册失败（%@），只震了", path ?: @"(无音色文件)");
 }
 
 static void WXNLNShowPush3(id self, SEL _cmd, id wrap, id ident, id fireDate,
