@@ -1224,7 +1224,8 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
         // 决定，声音/角标/呈现全部由它自己的逻辑处理。
         WXN_ALOG(@"前台呈现 -> 人在微信里，原实现奉还");
         if (gOrigWillPresent) {
-            gOrigWillPresent(self, _cmd, center, notification, completion);
+            ((void (*)(id, SEL, id, id, void (^)(NSUInteger)))gOrigWillPresent)(
+                self, _cmd, center, notification, completion);
         } else if (completion) {
             completion(UNNotificationPresentationOptionNone);
         }
