@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.30"
+#define WXN_VERSION     "2.31"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1599,6 +1599,20 @@ static BOOL WXNInstall(void) {
         any = YES;
     }
 
+    {
+        // 2.31：未读变更事件——钩它做角标同步（忠实转发）
+        Method mu = class_getInstanceMethod(cls, NSSelectorFromString(@"AsyncOnUnReadChange:"));
+        if (mu) {
+            IMP origU = method_getImplementation(mu);
+            if (origU != (IMP)WXNUnReadChangeHook) {
+                gOrigUnReadChange = origU;
+                method_setImplementation(mu, (IMP)WXNUnReadChangeHook);
+                WXN_ALOG(@"已挂 AsyncOnUnReadChange:（角标同步）");
+            }
+        } else {
+            WXN_ALOG(@"没有 AsyncOnUnReadChange:，角标同步走离开时兜底");
+        }
+    }
     NSString *three = @"AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:";
     {
         Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(three));
@@ -1620,6 +1634,39 @@ static BOOL gWasInWeChat = NO;
 
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
+// 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
+static IMP gOrigUnReadChange;
+
+static NSInteger WXNUnreadTotal(void) {
+    Class mgr = NSClassFromString(@"CMessageMgr");
+    if (!mgr) return -1;
+    id center = WXNServiceCenter();
+    if (!center || ![center respondsToSelector:@selector(getService:)]) return -1;
+    id inst = nil;
+    @try { inst = ((id (*)(id, SEL, Class))objc_msgSend)(center, @selector(getService:), mgr); }
+    @catch (__unused NSException *e) { return -1; }
+    if (!inst || ![inst respondsToSelector:@selector(GetUnReadCount)]) return -1;
+    @try {
+        return (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(inst, @selector(GetUnReadCount));
+    } @catch (__unused NSException *e) { return -1; }
+}
+
+static void WXNBadgeSyncToUnread(NSString *why) {
+    NSInteger unread = WXNUnreadTotal();
+    if (unread < 0) return;
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return;
+    @try {
+        [app setApplicationIconBadgeNumber:unread];
+        WXN_ALOG(@"角标同步=%ld（%@）", (long)unread, why ?: @"");
+    } @catch (__unused NSException *e) {}
+}
+
+static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
+    if (gOrigUnReadChange) ((void (*)(id, SEL, id))gOrigUnReadChange)(self, _cmd, a1);
+    WXNBadgeSyncToUnread(@"UnReadChange");
+}
+
 // 2.30：未读数侦察——找微信内部"总未读"的真实来源，
 // 给角标跟未读同步做证据。只在 debug 开时跑一次。
 static void WXNDiagUnread(void) {
@@ -1686,6 +1733,7 @@ static void WXNWatchFront(void) {
         if (in != gWasInWeChat) {
             gWasInWeChat = in;
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
+            if (!in) WXNBadgeSyncToUnread(@"离开微信");
             if (in) {
                 // 2.29：进微信不再清主屏角标——角标跟真实未读走，
                 // 由微信自己的未读同步逻辑管理（读了才会归零）
