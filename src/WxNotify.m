@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.24"
+#define WXN_VERSION     "2.25"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1069,17 +1069,19 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
 static IMP gOrigForSessionNotify; // AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:
 static NSMutableArray *gHookNames;  // 已挂上的消息钩子
 
-static void WXNForSessionNotify(id self, SEL _cmd, id session, id wrap, BOOL notify) {
+static BOOL WXNForSessionNotify(id self, SEL _cmd, id session, id wrap, BOOL notify) {
+    BOOL r = NO;
     if (gOrigForSessionNotify) {
-        ((void (*)(id, SEL, id, id, BOOL))gOrigForSessionNotify)(self, _cmd, session, wrap, notify);
+        r = ((BOOL (*)(id, SEL, id, id, BOOL))gOrigForSessionNotify)(self, _cmd, session, wrap, notify);
     }
     if (!notify) {
-        WXN_ALOG(@"[ForSessionNotify] notify=NO，微信自己都不想提醒，跳过");
-        return;
+        WXN_ALOG(@"[ForSessionNotify] notify=%d 原返回=%d", (int)notify, (int)r);
+        return r;
     }
     @autoreleasepool {
         WXNHandleMessage(self, wrap, @"AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:");
     }
+    return r;
 }
 
 // 两参数的消息钩子统一走这里：先调原实现，再从入参里把 CMessageWrap 拎出来
@@ -1105,17 +1107,21 @@ static id WXNPickWrap(id a, id b) {
     return nil;
 }
 
-static void WXNMsgHook2(id self, SEL _cmd, id a1, id a2) {
+static BOOL WXNMsgHook2(id self, SEL _cmd, id a1, id a2) {
     IMP orig = NULL;
     NSString *name = NSStringFromSelector(_cmd);
     pthread_mutex_lock(&gOrigLock);
     orig = (IMP)[[gOrigMap objectForKey:name] pointerValue];
     pthread_mutex_unlock(&gOrigLock);
-    if (orig) ((void (*)(id, SEL, id, id))orig)(self, _cmd, a1, a2);
+    // 2.25：原实现返回值原样带回——2.22/2.24 微信内无声的头号嫌疑就是
+    // void 直调把有返回值的方法冲成垃圾，微信的提醒决策变成抽签
+    BOOL r = NO;
+    if (orig) r = ((BOOL (*)(id, SEL, id, id))orig)(self, _cmd, a1, a2);
 
     @autoreleasepool {
         WXNHandleMessage(self, WXNPickWrap(a1, a2), name);
     }
+    return r;
 }
 
 // 微信在决定「要不要对外提醒」时会走这里，记一下就知道它到底想不想发通知
@@ -1499,6 +1505,14 @@ static void WXNInstallLocalNotificationProbe(void) {
     }
     // 只留两个真正有用的：onServiceInit 是抓实例最早的时机，
     // ShowPush 那一条里有一句"坐实认知"，其余全是日志，删掉。
+    {
+        Method m1 = class_getInstanceMethod(c, NSSelectorFromString(@"showPushWithMessageWrap:identifier:fireDate:isFromVoipPush:shouldSilent:"));
+        if (m1) {
+            char *rt = method_copyReturnType(m1);
+            WXN_ALOG(@"[类型侦察] showPush3 返回类型=%s", rt ?: @"?");
+            free(rt);
+        }
+    }
     BOOL a = WXNSwizzle(c, @"onServiceInit", (IMP)WXNLNInit, &gOrigLNInit);
     BOOL g = WXNSwizzle(c,
         @"showPushWithMessageWrap:identifier:fireDate:isFromVoipPush:shouldSilent:",
@@ -1637,15 +1651,25 @@ static BOOL WXNInstall(void) {
         }
         IMP orig = method_getImplementation(m);
         if (orig != (IMP)WXNMsgHook2) {
+            char *rt = method_copyReturnType(m);
+            WXN_ALOG(@"已挂 %@ 返回类型=%s", name, rt ?: @"?");
+            free(rt);
             gOrigMap[name] = [NSValue valueWithPointer:orig];
             method_setImplementation(m, (IMP)WXNMsgHook2);
-            WXN_ALOG(@"已挂 %@", name);
         }
         if (![gHookNames containsObject:name]) [gHookNames addObject:name];
         any = YES;
     }
 
     NSString *three = @"AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:";
+    {
+        Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(three));
+        if (m3) {
+            char *rt = method_copyReturnType(m3);
+            WXN_ALOG(@"[类型侦察] %@ 返回类型=%s", three, rt ?: @"?");
+            free(rt);
+        }
+    }
     any |= WXNSwizzle(cls, three, (IMP)WXNForSessionNotify, &gOrigForSessionNotify);
     if (gOrigForSessionNotify && ![gHookNames containsObject:three]) [gHookNames addObject:three];
 
