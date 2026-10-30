@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.32"
+#define WXN_VERSION     "2.33"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1646,12 +1646,35 @@ static BOOL gWasInWeChat = NO;
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
 // 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
-static NSInteger WXNUnreadTotal(void) {
-    id inst = gMsgMgr;
-    if (!inst || ![inst respondsToSelector:@selector(GetUnReadCount)]) return -1;
+static NSInteger WXNTryUnread(id obj) {
+    if (!obj) return -1;
+    // 2.33：不信 respondsToSelector——MMServiceWrapper 靠 ObjC 转发响应服务方法，
+    // 问它"有没有"永远是 NO，直接发，转发机制自己会兜
     @try {
-        return (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(inst, @selector(GetUnReadCount));
+        return (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(obj, @selector(GetUnReadCount));
     } @catch (__unused NSException *e) { return -1; }
+}
+
+static id gMsgMgrReal = nil;
+
+static NSInteger WXNUnreadTotal(void) {
+    id w = gMsgMgr;
+    if (!w) return -1;
+    NSInteger v = WXNTryUnread(w);
+    if (v >= 0) { gMsgMgrReal = w; return v; }
+    if (gMsgMgrReal) { v = WXNTryUnread(gMsgMgrReal); if (v >= 0) return v; }
+    // 包装器转发不通：翻它的 ivar 找内层真身
+    unsigned int n = 0;
+    Ivar *ivs = class_copyIvarList(object_getClass(w), &n);
+    for (unsigned int i = 0; i < n; i++) {
+        id inner = object_getIvar(w, ivs[i]);
+        if ([inner isKindOfClass:[NSObject class]] && inner != w) {
+            NSInteger r = WXNTryUnread(inner);
+            if (r >= 0) { gMsgMgrReal = inner; free(ivs); return r; }
+        }
+    }
+    free(ivs);
+    return -1;
 }
 
 static NSInteger gLastBadgeWritten = -999;
