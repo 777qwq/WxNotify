@@ -1651,15 +1651,26 @@ static NSInteger WXNUnreadTotal(void) {
     } @catch (__unused NSException *e) { return -1; }
 }
 
-static void WXNBadgeSyncToUnread(NSString *why) {
-    NSInteger unread = WXNUnreadTotal();
-    if (unread < 0) return;
+static NSInteger gLastBadgeWritten = -999;
+
+static void WXNBadgeWriteUnread(NSInteger unread, NSString *why) {
+    if (unread < 0 || unread == gLastBadgeWritten) return;
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return;
     @try {
         [app setApplicationIconBadgeNumber:unread];
+        gLastBadgeWritten = unread;
         WXN_ALOG(@"角标同步=%ld（%@）", (long)unread, why ?: @"");
     } @catch (__unused NSException *e) {}
+}
+
+static void WXNBadgeSyncToUnread(NSString *why) {
+    // 2.31：双采样——事件触发时内部计数可能还没落，立即读一次 + 0.5 秒复核
+    WXNBadgeWriteUnread(WXNUnreadTotal(), why);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXNBadgeWriteUnread(WXNUnreadTotal(), [why stringByAppendingString:@"+0.5s"]);
+                   });
 }
 
 static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
@@ -1733,7 +1744,13 @@ static void WXNWatchFront(void) {
         if (in != gWasInWeChat) {
             gWasInWeChat = in;
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
-            if (!in) WXNBadgeSyncToUnread(@"离开微信");
+            if (!in) {
+                WXNBadgeSyncToUnread(@"离开微信");
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                                   WXNBadgeWriteUnread(WXNUnreadTotal(), @"离开微信+1s");
+                               });
+            }
             if (in) {
                 // 2.29：进微信不再清主屏角标——角标跟真实未读走，
                 // 由微信自己的未读同步逻辑管理（读了才会归零）
