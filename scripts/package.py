@@ -77,7 +77,7 @@ def _tar_gz(entries):
             else:
                 ti.size = len(data)
                 tf.addfile(ti, io.BytesIO(data))
-    return gzip.compress(raw.getvalue(), mtime=0)
+    return gzip.compress(raw.getvalue(), compresslevel=9, mtime=0)   # 2.31: 对齐 dpkg-deb 压缩率
 
 
 def _ar(members):
