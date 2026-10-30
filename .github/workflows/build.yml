@@ -3,6 +3,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -48,3 +51,18 @@ jobs:
           path: |
             WxNotify-arm64.dylib
             WxNotify-arm64e.dylib
+
+      - name: Package deb
+        run: |
+          brew install ldid
+          python3 scripts/package.py --slices . --out dist
+          ls -la dist
+
+      - name: Release (出包后自动发行)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(grep '^Version:' build/DEBIAN/control | awk '{print $2}')
+          NOTES="自动发行，构建自 commit ${GITHUB_SHA::7}。"
+          gh release create "$V" dist/*.deb --title "WxNotify $V" --notes "$NOTES" \
+            || gh release upload "$V" dist/*.deb --clobber
