@@ -28,6 +28,8 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CADisplayLink.h>
 #import <UserNotifications/UserNotifications.h>
+#import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -1485,6 +1487,28 @@ static void WXNLNInit(id self, SEL _cmd) {
 
 static void WXNEndFakeBackground(NSString *why);   // 定义在后面，2.24 前台拦截用
 
+// 2.25：前台拦截后的本机提示。假后台窗口里微信以为自己不在前台、不会出
+// app 内提示音，以前那声是 willPresent 的 Sound 选项补的；推送被 2.24 吞掉
+// 后提示也跟着没了——横幅继续压，响铃+震动在这里自己接过来。
+static void WXNPlayInAppAlert(BOOL silent) {
+    if (silent) return;
+    AudioServicesPlaySystemSound(4095);   // kSystemSoundID_Vibrate（iPad 无震动，无害）
+    static AVAudioPlayer *player;
+    NSString *tone = WXNToneName();
+    NSString *path = nil;
+    if (tone.length) {
+        NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+        path = [[lib stringByAppendingPathComponent:@"Sounds"] stringByAppendingPathComponent:tone];
+    }
+    if (path.length) {
+        @try {
+            player = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:NULL];
+            if (player) { [player play]; return; }
+        } @catch (__unused NSException *e) {}
+    }
+    WXN_ALOG(@"前台提示：没有可用音色，只震了");
+}
+
 static void WXNLNShowPush3(id self, SEL _cmd, id wrap, id ident, id fireDate,
                            BOOL voip, BOOL silent) {
     WXNGrabLN(self);
@@ -1498,8 +1522,9 @@ static void WXNLNShowPush3(id self, SEL _cmd, id wrap, id ident, id fireDate,
     // 单横幅裸奔/双横幅都从这里来。在这里吞掉，与 delegate 状态彻底解耦。
     // voip 放行：来电提醒走微信自己的 CallKit 链路，不能掐。
     if (!voip && WXNInWeChatSafe(NULL)) {
-        WXN_ALOG(@"前台拦截 -> 人在微信里，吞掉原生本地推送（id=%@）", ident);
+        WXN_ALOG(@"前台拦截 -> 人在微信里，吞掉原生本地推送，改本机响铃（id=%@）", ident);
         if (gFakeBG) WXNEndFakeBackground(@"前台拦截");
+        WXNPlayInAppAlert(silent);
         return;
     }
     if (gOrigLNShowPush3) gOrigLNShowPush3(self, _cmd, wrap, ident, fireDate, voip, silent);
