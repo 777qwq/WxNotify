@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.23"
+#define WXN_VERSION     "2.24"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1121,37 +1121,13 @@ static void WXNMsgHook2(id self, SEL _cmd, id a1, id a2) {
 // 微信在决定「要不要对外提醒」时会走这里，记一下就知道它到底想不想发通知
 static IMP gOrigNotifyToExt;
 
-static void WXNNotifyToExt(id self, SEL _cmd, id a1) {
-    if (WXNSaneObj(a1)) {
-        @try {
-            WXN_ALOG(@"[MainThreadNotifyToExt] 微信要对外提醒 arg=%@ (%@)", a1,
-                     NSStringFromClass(object_getClass(a1)));
-        } @catch (__unused NSException *e) {
-            WXN_ALOG(@"[MainThreadNotifyToExt] 命中，但入参打印失败");
-        }
-    } else {
-        WXN_ALOG(@"[MainThreadNotifyToExt] 命中，入参不是对象(%p)", a1);
-    }
-    if (gOrigNotifyToExt) ((void (*)(id, SEL, id))gOrigNotifyToExt)(self, _cmd, a1);
-}
 
 // 推送决策点：CMessageMgr 收到消息后会在这两个方法里决定「要不要弹提醒」。
 // 2.9 的日志里连这两个方法都没出现，说明它在更前面就认定「我在前台」了；
 // 2.10 把它们记下来，就能看出是“没走到”还是“走到了但被拦”。
 static BOOL WXNReadLNBG(void);   // 定义在后面，这里先声明
 
-static void WXNMsgHook2B(id self, SEL _cmd, id a1, BOOL flag) {
-    IMP orig = NULL;
-    NSString *name = NSStringFromSelector(_cmd);
-    pthread_mutex_lock(&gOrigLock);
-    orig = (IMP)[[gOrigMap objectForKey:name] pointerValue];
-    pthread_mutex_unlock(&gOrigLock);
 
-    WXN_ALOG(@"[%@] 微信在考虑发推送 always=%d 认知后台=%d 内容=%@", name, (int)flag,
-             (int)WXNReadLNBG(), WXNTrim([a1 description] ?: @"", 100));
-
-    if (orig) ((void (*)(id, SEL, id, BOOL))orig)(self, _cmd, a1, flag);
-}
 
 // 投递后把系统里当前存在的通知 id 抄一份，用来分清屏上的第二张横幅是谁的
 static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
@@ -1673,41 +1649,6 @@ static BOOL WXNInstall(void) {
     any |= WXNSwizzle(cls, three, (IMP)WXNForSessionNotify, &gOrigForSessionNotify);
     if (gOrigForSessionNotify && ![gHookNames containsObject:three]) [gHookNames addObject:three];
 
-    // 只记不改：微信到底有没有决定对外提醒
-    SEL extSel = NSSelectorFromString(@"MainThreadNotifyToExt:");
-    NSMethodSignature *extSig = [cls instanceMethodSignatureForSelector:extSel];
-    if (extSig && extSig.numberOfArguments == 3 &&
-        strcmp([extSig getArgumentTypeAtIndex:2], "@") == 0) {
-        any |= WXNSwizzle(cls, @"MainThreadNotifyToExt:", (IMP)WXNNotifyToExt, &gOrigNotifyToExt);
-    } else if (extSig) {
-        WXN_ALOG(@"MainThreadNotifyToExt: 入参不是对象，不挂");
-    }
-
-    // 推送决策点（2.10 新增）
-    for (NSString *name in @[ @"AsyncOnPushMsg:isAlwaysShow:", @"onNewSyncShowPush:isAlwaysShow:" ]) {
-        SEL sel = NSSelectorFromString(name);
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
-            WXN_ALOG(@"没有 %@，跳过", name);
-            continue;
-        }
-        NSMethodSignature *sig = [cls instanceMethodSignatureForSelector:sel];
-        const char *t3 = (sig && sig.numberOfArguments > 3) ? [sig getArgumentTypeAtIndex:3] : "?";
-        if (!sig || sig.numberOfArguments != 4 ||
-            strcmp([sig getArgumentTypeAtIndex:2], "@") != 0 ||
-            (t3[0] != 'c' && t3[0] != 'B')) {
-            WXN_ALOG(@"%@ 的参数对不上，跳过", name);
-            continue;
-        }
-        IMP orig = method_getImplementation(m);
-        if (orig != (IMP)WXNMsgHook2B) {
-            gOrigMap[name] = [NSValue valueWithPointer:orig];
-            method_setImplementation(m, (IMP)WXNMsgHook2B);
-            WXN_ALOG(@"已挂 %@", name);
-        }
-        if (![gHookNames containsObject:name]) [gHookNames addObject:name];
-        any = YES;
-    }
     return any;
 }
 
