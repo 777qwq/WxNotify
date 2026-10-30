@@ -41,7 +41,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.29"
+#define WXN_VERSION     "2.30"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1216,9 +1216,12 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
              (int)gForceNextBanner, why ?: @"(无)");
 
     if (inWeChat) {
-        WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
-        WXNBadgeRollback(@"前台静默");
-        if (completion) completion(UNNotificationPresentationOptionNone);
+        // 2.30：8.0.7x 把 app 内提示音搬进了通知呈现链——原生行为靠微信自己的
+        // delegate 在这里给 Sound 选项。接管后给 None 等于把这声掐了。
+        // 只还声音不给横幅（Banner/List 不给），角标照旧回滚。
+        WXN_ALOG(@"前台呈现 -> 人在微信里，只还声音");
+        WXNBadgeRollback(@"前台只响");
+        if (completion) completion(UNNotificationPresentationOptionSound);
         return;
     }
 
