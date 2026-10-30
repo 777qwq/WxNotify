@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.28"
+#define WXN_VERSION     "2.29"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -633,78 +633,14 @@ static NSInteger WXNBadgeNext(void) {
     return gBadge;
 }
 
-// 前台被系统吞掉（没弹没响）时把这一条退回去，别让图标数字虚高
-static void WXNBadgeRollback(NSString *why) {
-    if (gBadge <= 0) return;
-    gBadge -= 1;
-    WXNBadgeWrite();
-    WXN_ALOG(@"角标回退到 %ld（%@）", (long)gBadge, why);
-}
 
-static void WXNBadgeReset(NSString *why) {
-    if (gBadge == 0) return;
-    WXN_ALOG(@"角标归零（%@，之前 %ld）", why, (long)gBadge);
-    gBadge = 0;
-    WXNBadgeWrite();
-}
+
+
 
 // 人在不在微信里，钩子里随时要问，先声明
 static BOOL WXNInWeChatSafe(NSString **whyOut);
 
-// 2.18：角标残留。
-// 微信平时靠 applicationDidBecomeActive 里那句清角标代码把数字抹掉，
-// 但 Immortalizer 把 scene 钉死在前台，微信永远"没有重新变成 active"，
-// 那段代码一次都不跑，数字就一直贴在桌面上（关掉真后台它才跑得到）。
-// 所以这里我们代它清，三条路一起走：老接口、UNS 的角标基数、通知中心残留。
-static void WXNClearBadgeNow(NSString *why, BOOL alsoRemoveDelivered) {
-    NSInteger before = gBadge;
-    gBadge = 0;
-    WXNBadgeWrite();
 
-    // 1) 老接口：直接改桌面图标上的数字
-    UIApplication *app = [UIApplication sharedApplication];
-    if (app) {
-        @try { [app setApplicationIconBadgeNumber:0]; }
-        @catch (__unused NSException *e) {}
-    }
-
-    // 2) iOS 16 的新接口。UNS 自己另外记着一份角标基数，
-    //    只清图标不清它，下一条通知投递时它又会把旧数字贴回来。
-    UNUserNotificationCenter *center = nil;
-    @try { center = [UNUserNotificationCenter currentNotificationCenter]; }
-    @catch (__unused NSException *e) { center = nil; }
-
-    SEL sbc = NSSelectorFromString(@"setBadgeCount:withCompletionHandler:");
-    if (center && [center respondsToSelector:sbc]) {
-        @try { ((void (*)(id, SEL, NSInteger, id))objc_msgSend)(center, sbc, 0, nil); }
-        @catch (__unused NSException *e) {}
-    }
-
-    // 3) 把已经看过的、我们自己补发的那几条从通知中心撤掉
-    if (alsoRemoveDelivered && center) {
-        SEL gd = NSSelectorFromString(@"getDeliveredNotificationsWithCompletionHandler:");
-        if ([center respondsToSelector:gd]) {
-            @try {
-                ((void (*)(id, SEL, id))objc_msgSend)(center, gd, ^(NSArray *list) {
-                    NSMutableArray *mine = [NSMutableArray array];
-                    for (id note in list) {
-                        id req = [note valueForKey:@"request"];
-                        NSString *rid = [req valueForKey:@"identifier"];
-                        if (rid.length && [rid hasPrefix:@"wxn-"]) [mine addObject:rid];
-                    }
-                    if (mine.count) {
-                        @try {
-                            [[UNUserNotificationCenter currentNotificationCenter]
-                                removeDeliveredNotificationsWithIdentifiers:mine];
-                        } @catch (__unused NSException *e) {}
-                    }
-                });
-            } @catch (__unused NSException *e) {}
-        }
-    }
-
-    if (before != 0) WXN_ALOG(@"角标清理：%ld -> 0（%@）", (long)before, why);
-}
 
 // 把微信自己那条提示音拷到 Library/Sounds，让通知用它
 static NSString *WXNToneName(void) {
@@ -1681,7 +1617,6 @@ static BOOL WXNInstall(void) {
 // 2.12：跟着 SpringBoard 的状态文件走。手指不再参与判断，
 // 但“人回到微信”这件事还得知道——用来清角标、写一条“回来了”的日志。
 static BOOL gWasInWeChat = NO;
-static double gEnteredWeChatAt = 0;
 
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
@@ -1693,17 +1628,8 @@ static void WXNWatchFront(void) {
             gWasInWeChat = in;
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
             if (in) {
-                gEnteredWeChatAt = CFAbsoluteTimeGetCurrent();
-                WXNClearBadgeNow(@"回到微信", YES);
-            } else {
-            }
-        }
-        if (in) {
-            // 清完还可能被贴回来（UNS 投递时带的角标数、微信自己的未读同步），
-            // 回来这 20 秒里每轮再压一次，压到 0 为止
-            double now = CFAbsoluteTimeGetCurrent();
-            if (gBadge != 0 || (gEnteredWeChatAt > 0 && now - gEnteredWeChatAt < 20.0)) {
-                WXNClearBadgeNow(@"回到微信（复查）", NO);
+                // 2.29：进微信不再清主屏角标——角标跟真实未读走，
+                // 由微信自己的未读同步逻辑管理（读了才会归零）
             }
         }
     } @catch (__unused NSException *e) {}
@@ -2042,12 +1968,6 @@ static void WXNInit(void) {
 
     WXNInstallLocalNotificationProbe();
     WXNInstallCognitionHooks();
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
-        WXNClearBadgeNow(@"微信变成 active", YES);
-    }];
     WXNWatchFront();
     WXNInstallWithRetry(0);
     WXNSetupWithRetry(0);
