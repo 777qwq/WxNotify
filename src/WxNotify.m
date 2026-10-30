@@ -1764,6 +1764,9 @@ static void WXNWatchFront(void) {
 }
 
 // 类可能比 dylib 的 constructor 晚就绪，最多重试 20 次（约 10 秒）
+static IMP gOrigUnReadChange;   // 2.31 前向声明（定义在未读侦察段）
+static void WXNUnReadChangeHook(id self, SEL _cmd, id a1);
+
 static void WXNInstallWithRetry(int attempt) {
     if (WXNInstall()) {
         // 微信可能在启动后才设置通知代理，跟着多试几次
