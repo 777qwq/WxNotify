@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.25"
+#define WXN_VERSION     "2.26"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1676,51 +1676,6 @@ static BOOL WXNInstall(void) {
     return any;
 }
 
-// 角标钩子：微信自己清角标时，我们记的未读数也跟着清。
-// 2.12 起不再挂 sendEvent:（触摸判断废弃），“回到微信”由前台状态文件判定。
-static void (*gOrigSetBadge)(id, SEL, NSInteger);
-
-static void WXNSetBadge(id self, SEL _cmd, NSInteger n) {
-    if (n == 0) {
-        WXNBadgeReset(@"微信自己清零");
-    } else if (WXNInWeChatSafe(NULL)) {
-        // 人就在微信里，它还想往图标上贴数字（未读同步），
-        // 贴上去没人会清，直接压成 0
-        WXNBadgeReset(@"人在微信里，拦住这次贴数字");
-        n = 0;
-    }
-    if (gOrigSetBadge) gOrigSetBadge(self, _cmd, n);
-}
-
-static void (*gOrigSetBadgeCount)(id, SEL, NSInteger, id);
-
-// iOS 16 起微信也可能走这个新接口设角标，同样拦
-static void WXNSetBadgeCount(id self, SEL _cmd, NSInteger n, id handler) {
-    if (n == 0) {
-        WXNBadgeReset(@"微信自己清零（新接口）");
-    } else if (WXNInWeChatSafe(NULL)) {
-        WXNBadgeReset(@"人在微信里，拦住这次贴数字（新接口）");
-        n = 0;
-    }
-    if (gOrigSetBadgeCount) {
-        ((void (*)(id, SEL, NSInteger, id))gOrigSetBadgeCount)(self, _cmd, n, handler);
-    } else if (handler) {
-        ((void (^)(id))handler)(nil);
-    }
-}
-
-static void WXNInstallBadge(void) {
-    Class cls = NSClassFromString(@"UIApplication");
-    if (!cls) { WXN_ALOG(@"角标钩子：找不到 UIApplication"); return; }
-    WXNSwizzle(cls, @"setApplicationIconBadgeNumber:", (IMP)WXNSetBadge, &gOrigSetBadge);
-
-    BOOL nb = WXNSwizzle(NSClassFromString(@"UNUserNotificationCenter"),
-                         @"setBadgeCount:withCompletionHandler:",
-                         (IMP)WXNSetBadgeCount, &gOrigSetBadgeCount);
-    WXN_ALOG(@"角标钩子：旧接口=%@ 新接口=%@", gOrigSetBadge ? @"已挂" : @"没挂上",
-             nb ? @"已挂" : @"没挂上");
-}
-
 // 2.12：跟着 SpringBoard 的状态文件走。手指不再参与判断，
 // 但“人回到微信”这件事还得知道——用来清角标、写一条“回来了”的日志。
 static BOOL gWasInWeChat = NO;
@@ -2139,7 +2094,6 @@ static void WXNInit(void) {
 
     WXNInstallLocalNotificationProbe();
     WXNInstallCognitionHooks();
-    WXNInstallBadge();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
