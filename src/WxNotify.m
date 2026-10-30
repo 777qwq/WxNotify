@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.22"
+#define WXN_VERSION     "2.23"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1219,9 +1219,15 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
              (int)gForceNextBanner, why ?: @"(无)");
 
     if (inWeChat) {
-        WXN_ALOG(@"前台呈现 -> 人在微信里，静默");
-        WXNBadgeRollback(@"前台静默");
-        if (completion) completion(UNNotificationPresentationOptionNone);
+        // 2.23：人在微信里 -> 原实现奉还。8.0.80 的前台提示音就走在微信自己的
+        // delegate 上，我们接管后返回 None 是掐声的根源。这里不替微信做任何
+        // 决定，声音/角标/呈现全部由它自己的逻辑处理。
+        WXN_ALOG(@"前台呈现 -> 人在微信里，原实现奉还");
+        if (gOrigWillPresent) {
+            gOrigWillPresent(self, _cmd, center, notification, completion);
+        } else if (completion) {
+            completion(UNNotificationPresentationOptionNone);
+        }
         return;
     }
 
