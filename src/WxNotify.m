@@ -41,7 +41,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.28"
+#define WXN_VERSION     "2.29"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -104,6 +104,8 @@ static NSString *WXNLogPath(void) {
         NSMutableArray *cands = [NSMutableArray array];
 
         NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *tmp = NSTemporaryDirectory();   // 2.29：放微信沙盒 tmp/，不占 Documents
+        if (tmp.length) [cands addObject:[tmp stringByAppendingPathComponent:@"wxnotify.log"]];
         if (docs.count) [cands addObject:[docs[0] stringByAppendingPathComponent:@"wxnotify.log"]];
         [cands addObject:@"/var/mobile/Library/Preferences/wxnotify.log"];
 
@@ -118,10 +120,18 @@ static NSString *WXNLogPath(void) {
     return path;
 }
 
+#define WXN_LOG_MAX  (30 * 1024)   // 2.29：日志上限 30KB，超了清空重写
+
 static void WXNLog(NSString *fmt, ...) {
-    // 2.17：日志默认关。要开就在 plist 里写 debug=true，
-    // 或者在 Preferences 下放一个空文件 cn.qwq.wxnotify.debug。
+    // 2.29：日志默认开（plist debug=false 或删掉标记文件可关）。
     if (!WXNDebug()) return;
+
+    // 超限就清空：日志只留最近的，不为排查历史背 30KB 以上的体积
+    NSString *lp = WXNLogPath();
+    if (lp) {
+        NSDictionary *st = [[NSFileManager defaultManager] attributesOfItemAtPath:lp error:NULL];
+        if (st && [st fileSize] > WXN_LOG_MAX) [[NSFileManager defaultManager] removeItemAtPath:lp error:NULL];
+    }
 
     va_list ap;
     va_start(ap, fmt);
@@ -178,10 +188,10 @@ static void WXNLoadConfig(void) {
     c.sound       = d[@"sound"]       ? [d[@"sound"] boolValue]       : YES;
     c.respectMute = d[@"respectMute"] ? [d[@"respectMute"] boolValue] : YES;
     c.avatar      = d[@"avatar"]      ? [d[@"avatar"] boolValue]      : NO;
-    // 日志默认关。想开：plist 里 debug=true，或者放一个空文件
+    // 2.29：日志默认开。想关：plist 里 debug=false（标记文件机制保留兼容）
     // /var/mobile/Library/Preferences/cn.qwq.wxnotify.debug（Filza 里新建就行）
     if (d[@"debug"]) c.debug = [d[@"debug"] boolValue];
-    else c.debug = [[NSFileManager defaultManager] fileExistsAtPath:@WXN_DEBUG_MARK];
+    else c.debug = YES;   // 2.29：日志默认开（plist 里 debug=false 可关）
     pthread_mutex_lock(&gCfgLock);
     gCfg = c;
     pthread_mutex_unlock(&gCfgLock);
