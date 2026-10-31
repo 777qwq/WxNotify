@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.46"
+#define WXN_VERSION     "2.47"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1318,18 +1318,24 @@ static NSInteger gNAMCount = -1;     // 2.45 前向引用
 // 走原生退出清理链。2 秒后看探针：微信自己写过角标就收手，没写才代笔。
 static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角标
 static void WXNNativeExitCleanup(void) {
-    if (!gLN || !gLNIsBG) return;           // 认知干预没启用就不碰
-    WXNCognitionForce(YES);                  // 复位成真实后台
-    // 2.45：写微信自己的口径——onAppIconTotalUnreadCountChange: 参数捕获的总未读
-    if (gNAMCount < 0) {
-        WXN_ALOG(@"[退出清理] 还没捕获过未读数（回调没触发过），不动角标");
+    // 2.47：撤掉离开时 force(YES)（诚实窗口遗骸，导致回微信转圈+认知残留）
+    // 总未读直接读 MMLocalNotificationMgr ivar0x40（NSInteger，微信自己维护、
+    // 本地推送 badge 的同一来源，8.0.79 反汇编实锤 numberWithInteger:[x22+0x40]）
+    NSInteger total = -1;
+    if (gLN && gLNIsBG) {
+        long long v = *(long long *)((char *)(__bridge void *)gLN + 0x40);
+        if (v >= 0 && v <= 999) total = (NSInteger)v;
+        WXN_ALOG(@"[退出清理] LN ivar0x40 总未读 = %lld", v);
+    }
+    if (total < 0) {
+        WXN_ALOG(@"[退出清理] 总未读不可得，不动角标");
         return;
     }
     Class nam = NSClassFromString(@"NotificationActionsMgr");
     if (!nam || !gOrigBadgeSet) return;
-    WXN_ALOG(@"[退出清理] 退出写总未读：角标 = %ld", (long)gNAMCount);
+    WXN_ALOG(@"[退出清理] 退出写总未读：角标 = %ld", (long)total);
     @try {
-        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), gNAMCount);
+        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), total);
     } @catch (NSException *e) {
         WXN_ALOG(@"[退出清理] 异常 %@", e);
     }
