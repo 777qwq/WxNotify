@@ -1336,11 +1336,14 @@ static void WXNNativeExitCleanup(void) {
                 if (ty[0]=='i') raw = *(int*)base;
                 if (ty[0]=='I') raw = *(unsigned int*)base;
             }
-            [dump appendFormat:@"%s@%ld=%@|", nm ? nm : "?", (long)off,
-                 (ty && (ty[0]=='q'||ty[0]=='l'||ty[0]=='i')) ? [NSString stringWithFormat:@"%lld", raw]
-               : (ty && (ty[0]=='Q'||ty[0]=='L'||ty[0]=='I')) ? [NSString stringWithFormat:@"%llu", (unsigned long long)raw]
-               : (ty && ty[0]=='@') ? ((*(void**)base) ? NSStringFromClass(object_getClass((__bridge id)(*(void**)base))) : @"nil")
-               : @"?");
+            NSString *shown = @"?";
+            if (ty && (ty[0]=='q'||ty[0]=='l'||ty[0]=='i')) shown = [NSString stringWithFormat:@"%lld", raw];
+            else if (ty && (ty[0]=='Q'||ty[0]=='L'||ty[0]=='I')) shown = [NSString stringWithFormat:@"%llu", (unsigned long long)raw];
+            else if (ty && ty[0]=='@') {
+                void *p = *(void**)base;
+                shown = p ? NSStringFromClass(object_getClass((__bridge id)p)) : @"nil";
+            }
+            [dump appendFormat:@"%s@%ld=%@|", nm ? nm : "?", (long)off, shown];
         }
         if (ivs) free(ivs);
         for (NSInteger i = 0; i < (NSInteger)(dump.length/1200)+1; i++) {
