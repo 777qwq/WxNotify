@@ -1570,7 +1570,7 @@ static void WXNUnReadChangeHook(id self, SEL _cmd, id a1);
 // 探针：只记日志不干预。用 IMP 直调转发，签名固定不依赖 method 编码。
 static IMP gOrigIconCountChange;    // 实例方法 onAppIconTotalUnreadCountChange:
 static IMP gOrigBadgeSet;           // 类方法   +setApplicationIconBadgeNumber:
-static void WXNIconCountChangeHook(id self, SEL _cmd, id note);
+static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1);
 static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n);
 
 static BOOL WXNInstall(void) {
