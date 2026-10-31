@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.36"
+#define WXN_VERSION     "2.37"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1303,6 +1303,32 @@ static void WXNCognitionForce(BOOL bg) {
     WXN_ALOG(@"微信的认知：m_isInBackground = %d", (int)bg);
 }
 
+// 2.37：交还原主——开保活时微信感知不到"用户离开"，原生退出清理链
+// （closeMainFrameWithoutReset → 清角标）从不执行。我们用 SBSCopy 的可靠
+// 离开事件，复位认知后触发微信自己的原版清理，不自己写清零逻辑。
+static void WXNNativeExitCleanup(void) {
+    if (!gLN || !gLNIsBG) return;           // 认知干预没启用就不碰
+    WXNCognitionForce(YES);                  // 复位成真实后台
+    UIApplication *app = [UIApplication sharedApplication];
+    id ad = app ? app.delegate : nil;
+    Class adCls = NSClassFromString(@"MicroMessengerAppDelegate");
+    if (!ad || !adCls || ![ad isKindOfClass:adCls]) {
+        WXN_ALOG(@"[退出清理] 拿不到 AppDelegate（ad=%@）", ad ? NSStringFromClass(object_getClass(ad)) : @"nil");
+        return;
+    }
+    SEL sel = NSSelectorFromString(@"closeMainFrameWithoutReset");
+    if (![ad respondsToSelector:sel]) {
+        WXN_ALOG(@"[退出清理] AppDelegate 不吃 closeMainFrameWithoutReset");
+        return;
+    }
+    WXN_ALOG(@"[退出清理] 离开事件 → 触发原生 closeMainFrameWithoutReset");
+    @try {
+        ((void (*)(id, SEL))objc_msgSend)(ad, sel);
+    } @catch (NSException *e) {
+        WXN_ALOG(@"[退出清理] 异常 %@", e);
+    }
+}
+
 static void WXNCognitionRestore(void) {
     WXNCognitionForce(NO);
 }
@@ -1854,11 +1880,11 @@ static void WXNWatchFront(void) {
             gWasInWeChat = in;
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
             if (!in) {
-                WXNBadgeSyncToUnread(@"离开微信");
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                                   WXNBadgeWriteUnread(WXNUnreadTotal(), @"离开微信+1s");
-                               });
+                // 2.37：交还原主——触发微信原生退出清理链（清角标等），
+                // 不再自己写角标（WXNBadgeSyncToUnread 撤出离开路径）
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    WXNNativeExitCleanup();
+                });
             }
             if (in) {
                 // 2.29：进微信不再清主屏角标——角标跟真实未读走，

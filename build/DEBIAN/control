@@ -1,6 +1,6 @@
 Package: cn.qwq.wxnotify
 Name: WxNotify
-Version: 2.36
+Version: 2.37
 Architecture: iphoneos-arm64
 Description: 让被保活的微信重新弹出横幅通知
 Depends: mobilesubstrate, firmware (>= 15.0)
