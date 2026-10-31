@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.53"
+#define WXN_VERSION     "2.54"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -870,6 +870,15 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         WXN_ALOG(@"[%@] 参数里没有 CMessageWrap，跳过", where);
         return;
     }
+    // 2.54：PreAdd/Add 双钩子会重复进这里——按 svrId 去重（计数用）
+    static NSMutableSet *gCountedSvr = nil;
+    if (!gCountedSvr) gCountedSvr = [NSMutableSet set];
+    NSString *svrKey = [NSString stringWithFormat:@"%lld", WXNLongLong(wrap, @"m_n64MesSvrID")];
+    BOOL alreadyCounted = [gCountedSvr containsObject:svrKey];
+    if (!alreadyCounted) {
+        [gCountedSvr addObject:svrKey];
+        if (gCountedSvr.count > 300) [gCountedSvr removeAllObjects]; // 防膨胀，粗粒度即可
+    }
 
     WXNConfig cfg = WXNConfigCopy();
     unsigned int type = WXNUInt(wrap, @"m_uiMessageType");
@@ -903,8 +912,9 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         }
         if (!isSender) {
             NSString *sess = rawChat.length ? rawChat : rawFrom;
-            if (sess.length) {
-                gNAMCount += 1;
+            if (sess.length && !alreadyCounted) {
+                // 2.54：只在锚定态（gNAMCount>=0）时才动总数；未锚定只记会话债
+                if (gNAMCount >= 0) gNAMCount += 1;
                 gSessionUnread[sess] = @([gSessionUnread[sess] integerValue] + 1);
                 WXN_ALOG(@"  [计数] 前台来消息 %ld（会话 %@ 记账 %d）", (long)gNAMCount, sess, [gSessionUnread[sess] intValue]);
             }
@@ -1870,14 +1880,8 @@ static void WXNBadgeSyncToUnread(NSString *why) {
 static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
     // 2.52：拆掉 BadSync——GetUnReadCount: 口径错误（有未读也返 0），每次回微信
     // 都把微信写好的角标清掉，是「没读被清/读完不清」混乱的真正元凶。
-    // 回调只留转发，不再写角标。
-    // 2.53：后台链路的未读变化会走 NAM 回调锚定计数；这里把会话债清掉
-    //（后台同步也会清会话未读，防止重复还债）。
+    // 回调只留转发，不再写角标、不清会话债（债务由 ClearUnRead 还、NAM 回调重锚定）。
     if (gOrigUnReadChange) ((void (*)(id, SEL, id))gOrigUnReadChange)(self, _cmd, a1);
-    if ([gSessionUnread count]) {
-        WXN_ALOG(@"[计数] UnReadChange：清空会话债（%@）", gSessionUnread);
-        [gSessionUnread removeAllObjects];
-    }
 }
 
 // 2.53：用户在微信里读掉一个会话 → 还债
@@ -1886,12 +1890,12 @@ static void WXNClearUnReadHook(id self, SEL _cmd, id from, id to) {
     NSString *sess = [from isKindOfClass:[NSString class]] ? from : nil;
     NSInteger debt = sess ? [gSessionUnread[sess] integerValue] : 0;
     if (debt > 0) {
-        gNAMCount -= debt;
+        if (gNAMCount >= 0) gNAMCount -= debt;
         gSessionUnread[sess] = @0;
         WXN_ALOG(@"[计数] ClearUnRead 还债 %ld（会话 %@）→ 总未读 %ld", (long)debt, sess, (long)gNAMCount);
     } else if (sess) {
-        // 读的会话没记过账（后台来的消息或微信自己的未读）：计数变脏
-        if (gNAMCount > 0) {
+        // 读的会话没记过账（微信自己的未读被读掉）：计数失效
+        if (gNAMCount >= 0) {
             gNAMCount = -1;
             WXN_ALOG(@"[计数] ClearUnRead 会话 %@ 无账可还，计数标脏（退出不写）", sess);
         }
@@ -1906,26 +1910,11 @@ static void WXNClearUnReadHook(id self, SEL _cmd, id from, id to) {
 // 钩子直接捕获它，退出时写这个值 = 微信自己的口径。
 static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
     if (self && !gNAMInstance) gNAMInstance = self;
+    // 2.54：回调参数 = 微信权威总数，重锚定并清会话债（自校准，防漂移）
     gNAMCount = (NSInteger)(uintptr_t)a1;
+    if ([gSessionUnread count]) [gSessionUnread removeAllObjects];
     WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 未读数=%ld self=%@",
              (long)gNAMCount, self ? NSStringFromClass(object_getClass(self)) : @"?");
-    // 2.46：8.0.79 存根显示 self->0x20 = 计数数组指针（按类型索引取值）。
-    // 倾倒前 16 个 int，对照参数找"总和"在哪个格子。
-    if (self) {
-        void *arr = *(void **)((char *)(__bridge void *)self + 0x20);
-        if (arr) {
-            NSInteger s = 0;
-            NSMutableString *dump = [NSMutableString string];
-            for (int i = 0; i < 16; i++) {
-                unsigned int v = *(unsigned int *)((char *)arr + i * 4);
-                s += (NSInteger)(int)v;
-                [dump appendFormat:@"%d,", (int)v];
-            }
-            WXN_ALOG(@"[角标探针] 计数数组=%@ sum=%ld", dump, (long)s);
-        } else {
-            WXN_ALOG(@"[角标探针] 计数数组指针为空");
-        }
-    }
     if (gOrigIconCountChange) ((void (*)(id, SEL, void *))gOrigIconCountChange)(self, _cmd, a1);
 }
 
