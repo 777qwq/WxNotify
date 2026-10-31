@@ -48,13 +48,16 @@
 // 2.12：SpringBoard 侧守卫写的真·最前台状态
 #define WXN_FRONT_PATH  "/var/mobile/Library/Preferences/cn.qwq.wxnotify.front"
 
+// 总是记：加载、挂钩结果、投递失败这类
+#define WXN_ALOG(fmt, ...) WXNLog(fmt, ##__VA_ARGS__)
+
 // 2.27：诊断分体开关——Preferences 下放对应空文件就跳过那组钩子，
-// 用于二分定位“微信内无声”的肇事钩子组；删文件+注销即恢复全量。
+// 用于二分定位"微信内无声"的肇事钩子组；删文件+注销即恢复全量。
 static BOOL WXNMarkerOff(const char *tag) {
     static char cache[8][64]; static BOOL val[8]; static int n=0;
     for (int i=0;i<n;i++) if (!strcmp(cache[i],tag)) return val[i];
     char path[128];
-    snprintf(path,sizeof(path),"\/var\/mobile\/Library\/Preferences\/cn.qwq.wxnotify.%s",tag);
+    snprintf(path,sizeof(path),"/var/mobile/Library/Preferences/cn.qwq.wxnotify.%s",tag);
     BOOL off = [[NSFileManager defaultManager] fileExistsAtPath:@(path)];
     if (n<8){ strncpy(cache[n],tag,63); val[n]=off; n++; }
     if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
@@ -181,8 +184,6 @@ static void WXNLog(NSString *fmt, ...) {
     pthread_mutex_unlock(&lock);
 }
 
-// 总是记：加载、挂钩结果、投递失败这类
-#define WXN_ALOG(fmt, ...) WXNLog(fmt, ##__VA_ARGS__)
 
 // 只在 debug=1 时记：每条消息的判断细节
 #define WXN_LOG(fmt, ...)                                                     \
