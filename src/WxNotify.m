@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.41"
+#define WXN_VERSION     "2.42"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1311,16 +1311,31 @@ static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角
 static void WXNNativeExitCleanup(void) {
     if (!gLN || !gLNIsBG) return;           // 认知干预没启用就不碰
     WXNCognitionForce(YES);                  // 复位成真实后台
-    // 2.40：诚实窗口已证伪（回调型感知），离开即刻代笔
-    long unread = (long)WXNUnreadTotal();
-    if (unread < 0) unread = 0;
-    Class nam = NSClassFromString(@"NotificationActionsMgr");
-    if (!nam || !gOrigBadgeSet) return;
-    WXN_ALOG(@"[退出清理] 离开即刻代笔：角标写 %ld", unread);
-    @try {
-        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), (NSInteger)unread);
-    } @catch (NSException *e) {
-        WXN_ALOG(@"[退出清理] 异常 %@", e);
+    // 2.42：全变体测量 + 保守写。gLastWeChatBadge = 微信自己最近一次写的角标值。
+    UIApplication *app = [UIApplication sharedApplication];
+    NSInteger curBadge = app ? app.applicationIconBadgeNumber : 0;
+    NSInteger v0 = -1, v1 = -1, v2 = -1;
+    id w = gMsgMgr;
+    if (w) {
+        @try { v0 = (NSInteger)((unsigned int (*)(id, SEL, NSInteger))objc_msgSend)(w, @selector(GetUnReadCount:), (NSInteger)0); } @catch (__unused NSException *e) {}
+        @try { v1 = (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(w, @selector(GetUnReadCount)); } @catch (__unused NSException *e) {}
+        @try { v2 = (NSInteger)((unsigned int (*)(id, SEL, NSInteger, NSInteger))objc_msgSend)(w, @selector(GetUnReadCount:CreateTimeLargerThan:), (NSInteger)0, (NSInteger)0); } @catch (__unused NSException *e) {}
+    }
+    WXN_ALOG(@"[退出清理] 测量：GC(0)=%ld GC=%ld CTL=%ld 当前角标=%ld", (long)v0, (long)v1, (long)v2, (long)curBadge);
+    NSInteger pick = -1;
+    for (NSInteger v in (@[ @(v0), @(v1), @(v2) ])) if (v > pick) pick = v;
+    if (pick > 0) {
+        Class nam = NSClassFromString(@"NotificationActionsMgr");
+        if (nam && gOrigBadgeSet) {
+            WXN_ALOG(@"[退出清理] 代笔：角标写 %ld", (long)pick);
+            @try {
+                ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), pick);
+            } @catch (NSException *e) {
+                WXN_ALOG(@"[退出清理] 异常 %@", e);
+            }
+        }
+    } else {
+        WXN_ALOG(@"[退出清理] 全口径为 0，不动角标（保住微信自己写的值）");
     }
 }
 
@@ -1729,6 +1744,9 @@ static BOOL gWasInWeChat = NO;
 // 撤掉等待，离开即刻代笔；采样失败必须打出异常详情（不能再吞）。
 // 2.41：8.0.80 实锤——无参 GetUnReadCount 不存在（unrecognized selector），
 // 方法清单里是带参的 GetUnReadCount:。按候选顺序试，命中即缓存不再重复试。
+// 2.42：GetUnReadCount:(0) 口径存疑（有未读时也返 0）——离开时全变体测量
+// 打日志，锁定正确口径前保守写：只有变体 >0 才写角标，全 0 不碰（不再把
+// 微信自己写好的未读角标清掉）。
 static NSInteger gUnreadSelIdx = -1;   // -1=未定 0=GetUnReadCount: 1=无参 2=GetUnReadCount:CreateTimeLargerThan:
 static NSInteger WXNTryUnreadVariants(id obj) {
     @try {
