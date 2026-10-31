@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.42"
+#define WXN_VERSION     "2.43"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1311,31 +1311,28 @@ static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角
 static void WXNNativeExitCleanup(void) {
     if (!gLN || !gLNIsBG) return;           // 认知干预没启用就不碰
     WXNCognitionForce(YES);                  // 复位成真实后台
-    // 2.42：全变体测量 + 保守写。gLastWeChatBadge = 微信自己最近一次写的角标值。
-    UIApplication *app = [UIApplication sharedApplication];
-    NSInteger curBadge = app ? app.applicationIconBadgeNumber : 0;
-    NSInteger v0 = -1, v1 = -1, v2 = -1;
-    id w = gMsgMgr;
-    if (w) {
-        @try { v0 = (NSInteger)((unsigned int (*)(id, SEL, NSInteger))objc_msgSend)(w, @selector(GetUnReadCount:), (NSInteger)0); } @catch (__unused NSException *e) {}
-        @try { v1 = (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(w, @selector(GetUnReadCount)); } @catch (__unused NSException *e) {}
-        @try { v2 = (NSInteger)((unsigned int (*)(id, SEL, NSInteger, NSInteger))objc_msgSend)(w, @selector(GetUnReadCount:CreateTimeLargerThan:), (NSInteger)0, (NSInteger)0); } @catch (__unused NSException *e) {}
-    }
-    WXN_ALOG(@"[退出清理] 测量：GC(0)=%ld GC=%ld CTL=%ld 当前角标=%ld", (long)v0, (long)v1, (long)v2, (long)curBadge);
-    NSInteger pick = -1;
-    for (NSInteger v in (@[ @(v0), @(v1), @(v2) ])) if (v > pick) pick = v;
-    if (pick > 0) {
-        Class nam = NSClassFromString(@"NotificationActionsMgr");
-        if (nam && gOrigBadgeSet) {
-            WXN_ALOG(@"[退出清理] 代笔：角标写 %ld", (long)pick);
-            @try {
-                ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), pick);
-            } @catch (NSException *e) {
-                WXN_ALOG(@"[退出清理] 异常 %@", e);
-            }
-        }
+    // 2.43：直接读 NotificationActionsMgr 单例的总未读 ivar（0x20，int），
+    // 这是微信自己维护的总未读，写它就是最直接的原生语义。
+    NSInteger total = -1;
+    if (gNAMInstance) {
+        unsigned int v = *(unsigned int *)((char *)(__bridge void *)gNAMInstance + 0x20);
+        if (v <= 999) total = (NSInteger)v;   // 越界值当无效
+        WXN_ALOG(@"[退出清理] NAM ivar0x20 总未读 = %u", v);
     } else {
-        WXN_ALOG(@"[退出清理] 全口径为 0，不动角标（保住微信自己写的值）");
+        WXN_ALOG(@"[退出清理] 还没抓到 NAM 单例");
+    }
+    if (total < 0) {
+        // 兜不到就不碰，保住微信自己写的角标
+        WXN_ALOG(@"[退出清理] 总未读不可得，不动角标");
+        return;
+    }
+    Class nam = NSClassFromString(@"NotificationActionsMgr");
+    if (!nam || !gOrigBadgeSet) return;
+    WXN_ALOG(@"[退出清理] 退出写总未读：角标 = %ld", (long)total);
+    @try {
+        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), total);
+    } @catch (NSException *e) {
+        WXN_ALOG(@"[退出清理] 异常 %@", e);
     }
 }
 
@@ -1611,6 +1608,9 @@ static IMP gOrigIconCountChange;    // 实例方法 onAppIconTotalUnreadCountCha
 static IMP gOrigBadgeSet;           // 类方法   +setApplicationIconBadgeNumber:
 static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1);
 static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n);
+// 2.43：NotificationActionsMgr 单例——ivar 0x20（int）= 微信自己维护的总未读
+// （8.0.79 反汇编：onAppIconTotalUnreadCountChange 链路 ldr w10,[x0,#0x20] → "set count %u"）
+static id gNAMInstance = nil;
 
 static BOOL WXNInstall(void) {
     Class cls = NSClassFromString(@"CMessageMgr");
@@ -1836,8 +1836,10 @@ static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
 // 2.35：参数不是 ObjC 对象（反汇编 ldr w10,[x0,#0x20] 是整数），绝不能碰。
 // 只打"触发了"，盲转发原始寄存器。
 static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
-    WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 触发（参数不解析）self=%@",
-             self ? NSStringFromClass(object_getClass(self)) : @"?");
+    if (self && !gNAMInstance) gNAMInstance = self;
+    WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 触发（参数不解析）self=%@ ivar0x20=%u",
+             self ? NSStringFromClass(object_getClass(self)) : @"?",
+             self ? *(unsigned int *)((char *)(__bridge void *)self + 0x20) : 0);
     if (gOrigIconCountChange) ((void (*)(id, SEL, void *))gOrigIconCountChange)(self, _cmd, a1);
     WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 处理完，当前采样 unread=%ld",
              (long)WXNUnreadTotal());
