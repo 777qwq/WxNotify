@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.35"
+#define WXN_VERSION     "2.36"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1563,6 +1563,9 @@ static void WXNSetupPresentationHooks(void) {
 }
 
 static IMP gOrigUnReadChange;   // 2.31
+// 2.36：清零路径探针——开保活时 closeMainFrameWithoutReset 跑没跑？无参方法，安全。
+static IMP gOrigCloseMainFrame;
+static void WXNCloseMainFrameHook(id self, SEL _cmd);
 static void WXNUnReadChangeHook(id self, SEL _cmd, id a1);
 
 // 2.34：8.0.79 静态分析实锤——角标真链在 NotificationActionsMgr，
@@ -1674,6 +1677,22 @@ static BOOL WXNInstall(void) {
             }
         }
     }
+    // 2.36：清零路径探针
+    {
+        Class ad = NSClassFromString(@"MicroMessengerAppDelegate");
+        Method m3 = ad ? class_getInstanceMethod(ad, NSSelectorFromString(@"closeMainFrameWithoutReset")) : NULL;
+        if (m3) {
+            IMP o3 = method_getImplementation(m3);
+            if (o3 != (IMP)WXNCloseMainFrameHook) {
+                gOrigCloseMainFrame = o3;
+                method_setImplementation(m3, (IMP)WXNCloseMainFrameHook);
+                WXN_ALOG(@"[角标探针] 已挂 -closeMainFrameWithoutReset");
+            }
+        } else {
+            WXN_ALOG(@"[角标探针] 没有 -closeMainFrameWithoutReset（ad=%@）",
+                     ad ? @"有" : @"无");
+        }
+    }
 
     return any;
 }
@@ -1758,6 +1777,14 @@ static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n) {
     WXN_ALOG(@"[角标探针] +setApplicationIconBadgeNumber:%ld（%@）", (long)n,
              self ? NSStringFromClass((Class)self) : @"?");
     if (gOrigBadgeSet) ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)(self, _cmd, n);
+}
+
+// 2.36：清零路径探针——只记触发与当时认知，不干预
+static void WXNCloseMainFrameHook(id self, SEL _cmd) {
+    WXN_ALOG(@"[角标探针] closeMainFrameWithoutReset 触发 self=%@ 认知后台=%d",
+             self ? NSStringFromClass(object_getClass(self)) : @"?",
+             (int)WXNReadLNBG());
+    if (gOrigCloseMainFrame) ((void (*)(id, SEL))gOrigCloseMainFrame)(self, _cmd);
 }
 
 // 2.30：未读数侦察——找微信内部"总未读"的真实来源，
