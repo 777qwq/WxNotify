@@ -1339,7 +1339,7 @@ static void WXNNativeExitCleanup(void) {
             [dump appendFormat:@"%s@%ld=%@|", nm ? nm : "?", (long)off,
                  (ty && (ty[0]=='q'||ty[0]=='l'||ty[0]=='i')) ? [NSString stringWithFormat:@"%lld", raw]
                : (ty && (ty[0]=='Q'||ty[0]=='L'||ty[0]=='I')) ? [NSString stringWithFormat:@"%llu", (unsigned long long)raw]
-               : (ty && ty[0]=='@') ? ((id)(__bridge void *)(*(void**)base) ? NSStringFromClass(object_getClass(*(__bridge id*)base)) : @"nil")
+               : (ty && ty[0]=='@') ? ((*(void**)base) ? NSStringFromClass(object_getClass((__bridge id)(*(void**)base))) : @"nil")
                : @"?");
         }
         if (ivs) free(ivs);
