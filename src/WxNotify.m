@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.55"
+#define WXN_VERSION     "2.27"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -48,7 +48,18 @@
 // 2.12：SpringBoard 侧守卫写的真·最前台状态
 #define WXN_FRONT_PATH  "/var/mobile/Library/Preferences/cn.qwq.wxnotify.front"
 
-
+// 2.27：诊断分体开关——Preferences 下放对应空文件就跳过那组钩子，
+// 用于二分定位“微信内无声”的肇事钩子组；删文件+注销即恢复全量。
+static BOOL WXNMarkerOff(const char *tag) {
+    static char cache[8][64]; static BOOL val[8]; static int n=0;
+    for (int i=0;i<n;i++) if (!strcmp(cache[i],tag)) return val[i];
+    char path[128];
+    snprintf(path,sizeof(path),"\/var\/mobile\/Library\/Preferences\/cn.qwq.wxnotify.%s",tag);
+    BOOL off = [[NSFileManager defaultManager] fileExistsAtPath:@(path)];
+    if (n<8){ strncpy(cache[n],tag,63); val[n]=off; n++; }
+    if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
+    return off;
+}
 
 // 通知里显示的内容上限，防止超长消息把横幅撑爆
 #define WXN_BODY_MAX    240
@@ -633,14 +644,78 @@ static NSInteger WXNBadgeNext(void) {
     return gBadge;
 }
 
+// 前台被系统吞掉（没弹没响）时把这一条退回去，别让图标数字虚高
+static void WXNBadgeRollback(NSString *why) {
+    if (gBadge <= 0) return;
+    gBadge -= 1;
+    WXNBadgeWrite();
+    WXN_ALOG(@"角标回退到 %ld（%@）", (long)gBadge, why);
+}
 
-
-
+static void WXNBadgeReset(NSString *why) {
+    if (gBadge == 0) return;
+    WXN_ALOG(@"角标归零（%@，之前 %ld）", why, (long)gBadge);
+    gBadge = 0;
+    WXNBadgeWrite();
+}
 
 // 人在不在微信里，钩子里随时要问，先声明
 static BOOL WXNInWeChatSafe(NSString **whyOut);
 
+// 2.18：角标残留。
+// 微信平时靠 applicationDidBecomeActive 里那句清角标代码把数字抹掉，
+// 但 Immortalizer 把 scene 钉死在前台，微信永远"没有重新变成 active"，
+// 那段代码一次都不跑，数字就一直贴在桌面上（关掉真后台它才跑得到）。
+// 所以这里我们代它清，三条路一起走：老接口、UNS 的角标基数、通知中心残留。
+static void WXNClearBadgeNow(NSString *why, BOOL alsoRemoveDelivered) {
+    NSInteger before = gBadge;
+    gBadge = 0;
+    WXNBadgeWrite();
 
+    // 1) 老接口：直接改桌面图标上的数字
+    UIApplication *app = [UIApplication sharedApplication];
+    if (app) {
+        @try { [app setApplicationIconBadgeNumber:0]; }
+        @catch (__unused NSException *e) {}
+    }
+
+    // 2) iOS 16 的新接口。UNS 自己另外记着一份角标基数，
+    //    只清图标不清它，下一条通知投递时它又会把旧数字贴回来。
+    UNUserNotificationCenter *center = nil;
+    @try { center = [UNUserNotificationCenter currentNotificationCenter]; }
+    @catch (__unused NSException *e) { center = nil; }
+
+    SEL sbc = NSSelectorFromString(@"setBadgeCount:withCompletionHandler:");
+    if (center && [center respondsToSelector:sbc]) {
+        @try { ((void (*)(id, SEL, NSInteger, id))objc_msgSend)(center, sbc, 0, nil); }
+        @catch (__unused NSException *e) {}
+    }
+
+    // 3) 把已经看过的、我们自己补发的那几条从通知中心撤掉
+    if (alsoRemoveDelivered && center) {
+        SEL gd = NSSelectorFromString(@"getDeliveredNotificationsWithCompletionHandler:");
+        if ([center respondsToSelector:gd]) {
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(center, gd, ^(NSArray *list) {
+                    NSMutableArray *mine = [NSMutableArray array];
+                    for (id note in list) {
+                        id req = [note valueForKey:@"request"];
+                        NSString *rid = [req valueForKey:@"identifier"];
+                        if (rid.length && [rid hasPrefix:@"wxn-"]) [mine addObject:rid];
+                    }
+                    if (mine.count) {
+                        @try {
+                            [[UNUserNotificationCenter currentNotificationCenter]
+                                removeDeliveredNotificationsWithIdentifiers:mine];
+                        } @catch (__unused NSException *e) {}
+                    }
+                });
+            } @catch (__unused NSException *e) {}
+        }
+    }
+
+    if (before != 0) WXN_ALOG(@"角标清理：%ld -> 0（%@）", (long)before, why);
+}
 
 // 把微信自己那条提示音拷到 Library/Sounds，让通知用它
 static NSString *WXNToneName(void) {
@@ -867,6 +942,7 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         WXN_ALOG(@"[%@] 参数里没有 CMessageWrap，跳过", where);
         return;
     }
+
     WXNConfig cfg = WXNConfigCopy();
     unsigned int type = WXNUInt(wrap, @"m_uiMessageType");
     NSString *rawFrom = WXNStr(wrap, @"m_nsFromUsr");
@@ -1224,19 +1300,12 @@ static void WXNHookDelegateClass(Class cls) {
 @end
 
 static IMP gOrigSetDelegate;
-static id gNAMInstance;   // 2.44 前向引用（声明在 WXNInstall 段）
 
 static void WXNSetDelegate(id self, SEL _cmd, id delegate) {
     if (gOrigSetDelegate) ((void (*)(id, SEL, id))gOrigSetDelegate)(self, _cmd, delegate);
     if (delegate) {
         WXN_ALOG(@"UNUserNotificationCenter 换了代理：%@",
                  NSStringFromClass(object_getClass(delegate)));
-        // 2.44：NotificationActionsMgr 当代理的瞬间抓单例——总未读 ivar 的宿主
-        Class nam = NSClassFromString(@"NotificationActionsMgr");
-        if (nam && [delegate isKindOfClass:nam] && !gNAMInstance) {
-            gNAMInstance = delegate;
-            WXN_ALOG(@"[退出清理] 已抓到 NAM 单例（setDelegate）");
-        }
         WXNHookDelegateClass(object_getClass(delegate));
     }
 }
@@ -1309,34 +1378,6 @@ static void WXNCognitionForce(BOOL bg) {
     WXN_ALOG(@"微信的认知：m_isInBackground = %d", (int)bg);
 }
 
-static IMP gOrigBadgeSet;            // 2.39 前向引用（声明在 WXNInstall 段）
-static IMP gOrigClearUnRead = nil;
-// 2.55：读事件旗子——ClearUnRead 触发过 = 用户读过会话，退出时清 0（原生语义）
-static BOOL gReadSinceLeave = NO;
-static void WXNClearUnReadHook(id self, SEL _cmd, id from, id to);
-// 2.39：诚实窗口——离开时停 2 秒干预，让微信自己的监控撞上真实状态、
-// 走原生退出清理链。2 秒后看探针：微信自己写过角标就收手，没写才代笔。
-static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角标
-static void WXNNativeExitCleanup(void) {
-    // 2.55：极简语义——
-    //  退出前读过会话（ClearUnRead 旗子）→ 清 0（原生 closeMainFrame 语义，修「读完不清」）
-    //  没读过 → 完全不碰（后台链写好的角标 = 真实未读，保留）
-    if (gReadSinceLeave) {
-        Class nam = NSClassFromString(@"NotificationActionsMgr");
-        if (nam && gOrigBadgeSet) {
-            WXN_ALOG(@"[退出清理] 退出前读过会话 → 角标清 0");
-            @try {
-                ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), 0);
-            } @catch (NSException *e) {
-                WXN_ALOG(@"[退出清理] 异常 %@", e);
-            }
-        }
-        gReadSinceLeave = NO;
-    } else {
-        WXN_ALOG(@"[退出清理] 无读事件，不碰角标");
-    }
-}
-
 static void WXNCognitionRestore(void) {
     WXNCognitionForce(NO);
 }
@@ -1407,17 +1448,9 @@ static void WXNTryGrabLN(NSString *why) {
 }
 
 // 微信向服务容器要东西的时候顺手看一眼，正好给它时就抓住
-static id gMsgMgr = nil;   // 2.32：CMessageMgr 真身（角标同步用）
-
 static id WXNGetServiceHook(id self, SEL _cmd, Class cls) {
     id svc = gOrigGetService ? gOrigGetService(self, _cmd, cls) : nil;
     if (svc && cls == NSClassFromString(@"MMLocalNotificationMgr")) WXNGrabLN(svc);
-    // 2.32：微信自己来拿 CMessageMgr 时顺手抓真身（getService 会给包装对象，
-    // 直接调拿不到能响应 GetUnReadCount 的实例）
-    if (svc && cls == NSClassFromString(@"CMessageMgr") && gMsgMgr != svc) {
-        gMsgMgr = svc;
-        WXN_ALOG(@"[角标同步] 抓到 CMessageMgr 真身：%@", NSStringFromClass(object_getClass(svc)));
-    }
     return svc;
 }
 
@@ -1569,6 +1602,7 @@ static void WXNAddRequest(id self, SEL _cmd, id req, id handler) {
 }
 
 static void WXNSetupPresentationHooks(void) {
+    if (WXNMarkerOff("no_delegate")) return;   // 2.27 诊断分体
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
     if (!center) return;
 
@@ -1596,23 +1630,6 @@ static void WXNSetupPresentationHooks(void) {
     }
 }
 
-static IMP gOrigUnReadChange;   // 2.31
-// 2.36：清零路径探针——开保活时 closeMainFrameWithoutReset 跑没跑？无参方法，安全。
-static IMP gOrigCloseMainFrame;
-static void WXNCloseMainFrameHook(id self, SEL _cmd);
-static void WXNUnReadChangeHook(id self, SEL _cmd, id a1);
-
-// 2.34：8.0.79 静态分析实锤——角标真链在 NotificationActionsMgr，
-// 清零点在 -[MicroMessengerAppDelegate closeMainFrameWithoutReset]（"User exit"）。
-// 探针：只记日志不干预。用 IMP 直调转发，签名固定不依赖 method 编码。
-static IMP gOrigIconCountChange;    // 实例方法 onAppIconTotalUnreadCountChange:
-static IMP gOrigBadgeSet;           // 类方法   +setApplicationIconBadgeNumber:
-static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1);
-static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n);
-// 2.43：NotificationActionsMgr 单例——ivar 0x20（int）= 微信自己维护的总未读
-// （8.0.79 反汇编：onAppIconTotalUnreadCountChange 链路 ldr w10,[x0,#0x20] → "set count %u"）
-static id gNAMInstance = nil;
-
 static BOOL WXNInstall(void) {
     Class cls = NSClassFromString(@"CMessageMgr");
     if (!cls) return NO;
@@ -1658,20 +1675,6 @@ static BOOL WXNInstall(void) {
         any = YES;
     }
 
-    {
-        // 2.31：未读变更事件——钩它做角标同步（忠实转发）
-        Method mu = class_getInstanceMethod(cls, NSSelectorFromString(@"AsyncOnUnReadChange:"));
-        if (mu) {
-            IMP origU = method_getImplementation(mu);
-            if (origU != (IMP)WXNUnReadChangeHook) {
-                gOrigUnReadChange = origU;
-                method_setImplementation(mu, (IMP)WXNUnReadChangeHook);
-                WXN_ALOG(@"已挂 AsyncOnUnReadChange:（角标同步）");
-            }
-        } else {
-            WXN_ALOG(@"没有 AsyncOnUnReadChange:，角标同步走离开时兜底");
-        }
-    }
     NSString *three = @"AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:";
     {
         Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(three));
@@ -1684,454 +1687,34 @@ static BOOL WXNInstall(void) {
     any |= WXNSwizzle(cls, three, (IMP)WXNForSessionNotify, &gOrigForSessionNotify);
     if (gOrigForSessionNotify && ![gHookNames containsObject:three]) [gHookNames addObject:three];
 
-    // 2.34：角标真链探针（NotificationActionsMgr）
-    {
-        Class nam = NSClassFromString(@"NotificationActionsMgr");
-        if (!nam) {
-            WXN_ALOG(@"[角标探针] 没有 NotificationActionsMgr");
-        } else {
-            Method m1 = class_getInstanceMethod(nam, NSSelectorFromString(@"onAppIconTotalUnreadCountChange:"));
-            if (m1) {
-                IMP o1 = method_getImplementation(m1);
-                if (o1 != (IMP)WXNIconCountChangeHook) {
-                    gOrigIconCountChange = o1;
-                    method_setImplementation(m1, (IMP)WXNIconCountChangeHook);
-                    WXN_ALOG(@"[角标探针] 已挂 -onAppIconTotalUnreadCountChange:");
-                }
-            } else {
-                WXN_ALOG(@"[角标探针] 没有 -onAppIconTotalUnreadCountChange:");
-            }
-            Method m2 = class_getClassMethod(nam, NSSelectorFromString(@"setApplicationIconBadgeNumber:"));
-            if (m2) {
-                IMP o2 = method_getImplementation(m2);
-                if (o2 != (IMP)WXNBadgeSetHook) {
-                    gOrigBadgeSet = o2;
-                    method_setImplementation(m2, (IMP)WXNBadgeSetHook);
-                    WXN_ALOG(@"[角标探针] 已挂 +setApplicationIconBadgeNumber:");
-                }
-            } else {
-                WXN_ALOG(@"[角标探针] 没有 +setApplicationIconBadgeNumber:");
-            }
-        }
-    }
-    // 2.36：清零路径探针
-    {
-        Class ad = NSClassFromString(@"MicroMessengerAppDelegate");
-        Method m3 = ad ? class_getInstanceMethod(ad, NSSelectorFromString(@"closeMainFrameWithoutReset")) : NULL;
-        if (m3) {
-            IMP o3 = method_getImplementation(m3);
-            if (o3 != (IMP)WXNCloseMainFrameHook) {
-                gOrigCloseMainFrame = o3;
-                method_setImplementation(m3, (IMP)WXNCloseMainFrameHook);
-                WXN_ALOG(@"[角标探针] 已挂 -closeMainFrameWithoutReset");
-            }
-        } else {
-            WXN_ALOG(@"[角标探针] 没有 -closeMainFrameWithoutReset（ad=%@）",
-                     ad ? @"有" : @"无");
-        }
-    }
-
-    // 2.55：读事件旗子——挂 ClearUnRead:FromID:ToID:
-    {
-        Method mc = class_getInstanceMethod(cls, NSSelectorFromString(@"ClearUnRead:FromID:ToID:"));
-        if (mc) {
-            IMP oc = method_getImplementation(mc);
-            if (oc != (IMP)WXNClearUnReadHook) {
-                gOrigClearUnRead = oc;
-                method_setImplementation(mc, (IMP)WXNClearUnReadHook);
-                WXN_ALOG(@"[角标] 已挂 ClearUnRead:FromID:ToID:");
-            }
-        } else {
-            WXN_ALOG(@"[角标] 没有 ClearUnRead:FromID:ToID:");
-        }
-    }
-
     return any;
 }
 
 // 2.12：跟着 SpringBoard 的状态文件走。手指不再参与判断，
 // 但“人回到微信”这件事还得知道——用来清角标、写一条“回来了”的日志。
 static BOOL gWasInWeChat = NO;
+static double gEnteredWeChatAt = 0;
 
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
-// 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
-// 2.40：诚实窗口已被实证证伪（两轮离开窗口内微信零动作，回调型感知），
-// 撤掉等待，离开即刻代笔；采样失败必须打出异常详情（不能再吞）。
-// 2.41：8.0.80 实锤——无参 GetUnReadCount 不存在（unrecognized selector），
-// 方法清单里是带参的 GetUnReadCount:。按候选顺序试，命中即缓存不再重复试。
-// 2.42：GetUnReadCount:(0) 口径存疑（有未读时也返 0）——离开时全变体测量
-// 打日志，锁定正确口径前保守写：只有变体 >0 才写角标，全 0 不碰（不再把
-// 微信自己写好的未读角标清掉）。
-static NSInteger gUnreadSelIdx = -1;   // -1=未定 0=GetUnReadCount: 1=无参 2=GetUnReadCount:CreateTimeLargerThan:
-static NSInteger WXNTryUnreadVariants(id obj) {
-    @try {
-        if (gUnreadSelIdx == 0 || gUnreadSelIdx == -1) {
-            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL, NSInteger))objc_msgSend)(obj, @selector(GetUnReadCount:), (NSInteger)0);
-            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 0; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount: -> %ld", (long)v); }
-            return v;
-        }
-    } @catch (NSException *e) {
-        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount: 不通：%@", e.reason);
-    }
-    @try {
-        if (gUnreadSelIdx == 1 || gUnreadSelIdx == -1) {
-            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(obj, @selector(GetUnReadCount));
-            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 1; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount -> %ld", (long)v); }
-            return v;
-        }
-    } @catch (NSException *e) {
-        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount 不通：%@", e.reason);
-    }
-    @try {
-        if (gUnreadSelIdx == 2 || gUnreadSelIdx == -1) {
-            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL, NSInteger, NSInteger))objc_msgSend)(obj, @selector(GetUnReadCount:CreateTimeLargerThan:), (NSInteger)0, (NSInteger)0);
-            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 2; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount:CreateTimeLargerThan: -> %ld", (long)v); }
-            return v;
-        }
-    } @catch (NSException *e) {
-        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount:CreateTimeLargerThan: 不通：%@", e.reason);
-    }
-    return -1;
-}
-static NSInteger WXNTryUnread(id obj) {
-    if (!obj) return -1;
-    return WXNTryUnreadVariants(obj);
-}
+// 只在 debug 打开时探，两分钟最多一条，别刷屏。
+static double gLastProbeAt = 0;
 
-static id gMsgMgrReal = nil;
-
-static NSInteger WXNUnreadTotal(void) {
-    id w = gMsgMgr;
-    if (!w) return -1;
-    NSInteger v = WXNTryUnread(w);
-    if (v >= 0) { gMsgMgrReal = w; return v; }
-    if (gMsgMgrReal) { v = WXNTryUnread(gMsgMgrReal); if (v >= 0) return v; }
-    // 包装器转发不通：翻它的 ivar 找内层真身
-    unsigned int n = 0;
-    Ivar *ivs = class_copyIvarList(object_getClass(w), &n);
-    for (unsigned int i = 0; i < n; i++) {
-        id inner = object_getIvar(w, ivs[i]);
-        if ([inner isKindOfClass:[NSObject class]] && inner != w) {
-            NSInteger r = WXNTryUnread(inner);
-            if (r >= 0) { gMsgMgrReal = inner; free(ivs); return r; }
-        }
-    }
-    free(ivs);
-    return -1;
-}
-
-static NSInteger gLastBadgeWritten = -999;
-
-static void WXNBadgeWriteUnread(NSInteger unread, NSString *why) {
-    if (unread < 0 || unread == gLastBadgeWritten) return;
-    UIApplication *app = [UIApplication sharedApplication];
-    if (!app) return;
-    @try {
-        [app setApplicationIconBadgeNumber:unread];
-        gLastBadgeWritten = unread;
-        WXN_ALOG(@"角标同步=%ld（%@）", (long)unread, why ?: @"");
-    } @catch (__unused NSException *e) {}
-}
-
-static void WXNBadgeSyncToUnread(NSString *why) {
-    // 2.31：双采样——事件触发时内部计数可能还没落，立即读一次 + 0.5 秒复核
-    WXNBadgeWriteUnread(WXNUnreadTotal(), why);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+static void WXNProbeOnLeave(void) {
+    if (!WXNDebug()) return;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastProbeAt < 120.0) return;
+    gLastProbeAt = now;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       WXNBadgeWriteUnread(WXNUnreadTotal(), [why stringByAppendingString:@"+0.5s"]);
-                   });
-}
-
-static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
-    // 2.52：拆掉 BadSync——GetUnReadCount: 口径错误（有未读也返 0），每次回微信
-    // 都把微信写好的角标清掉，是「没读被清/读完不清」混乱的真正元凶。
-    // 回调只留转发，不再写角标、不清会话债（债务由 ClearUnRead 还、NAM 回调重锚定）。
-    if (gOrigUnReadChange) ((void (*)(id, SEL, id))gOrigUnReadChange)(self, _cmd, a1);
-}
-
-// 2.53：用户在微信里读掉一个会话 → 还债
-static void WXNClearUnReadHook(id self, SEL _cmd, id from, id to) {
-    if (gOrigClearUnRead) ((void (*)(id, SEL, id, id))gOrigClearUnRead)(self, _cmd, from, to);
-    if (!gReadSinceLeave) {
-        gReadSinceLeave = YES;
-        WXN_ALOG(@"[角标] 检测到读事件（ClearUnRead），退出时清 0");
-    }
-}
-
-// 2.34：角标真链探针
-// 2.35：参数不是 ObjC 对象（反汇编 ldr w10,[x0,#0x20] 是整数），绝不能碰。
-// 只打"触发了"，盲转发原始寄存器。
-// 2.45：反汇编实锤——onAppIconTotalUnreadCountChange: 的参数 x2 就是总未读数
-// （方法内 mov x19,x2 … cmp applicationState,#2 … setApplicationIconBadgeNumber:(x19)）。
-// 钩子直接捕获它，退出时写这个值 = 微信自己的口径。
-static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
-    if (self && !gNAMInstance) gNAMInstance = self;
-    WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 触发（参数不解析）");
-    if (gOrigIconCountChange) ((void (*)(id, SEL, void *))gOrigIconCountChange)(self, _cmd, a1);
-}
-
-static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n);
-// 2.43：NotificationActionsMgr 单例——ivar 0x20（int）= 微信自己维护的总未读
-// （8.0.79 反汇编：onAppIconTotalUnreadCountChange 链路 ldr w10,[x0,#0x20] → "set count %u"）
-
-static BOOL WXNInstall(void) {
-    Class cls = NSClassFromString(@"CMessageMgr");
-    if (!cls) return NO;
-
-    if (!gOrigMap) gOrigMap = [NSMutableDictionary dictionary];
-    if (!gHookNames) gHookNames = [NSMutableArray array];
-
-    BOOL any = NO;
-
-    // 微信各版本的消息到达链路不一样，能挂的全挂上；重复命中由去重挡掉。
-    // 只能挂两个参数全为 id 的，带基本类型的（fixTime 那种）参数对不上，不碰。
-    NSArray<NSString *> *two = @[
-        @"AsyncOnPreAddMsg:MsgWrap:",
-        @"AsyncOnAddMsg:MsgWrap:",
-        @"AsyncOnAddMsgForSession:MsgWrap:",
-        @"AddMsg:MsgWrap:",
-        @"AsyncOnAddMsgListForSession:NotifyUsrName:",
-        @"onNewSyncAddMsgSessionArray:withUsers:",
-    ];
-    for (NSString *name in two) {
-        Method m = class_getInstanceMethod(cls, NSSelectorFromString(name));
-        if (!m) {
-            WXN_ALOG(@"没有 %@，跳过", name);
-            continue;
-        }
-        // 入参不是两个对象的就不碰，否则会把非对象入参当 id 用
-        NSMethodSignature *sig = [cls instanceMethodSignatureForSelector:NSSelectorFromString(name)];
-        if (!sig || sig.numberOfArguments != 4 ||
-            strcmp([sig getArgumentTypeAtIndex:2], "@") != 0 ||
-            strcmp([sig getArgumentTypeAtIndex:3], "@") != 0) {
-            WXN_ALOG(@"%@ 的入参不是两个对象，跳过", name);
-            continue;
-        }
-        IMP orig = method_getImplementation(m);
-        if (orig != (IMP)WXNMsgHook2) {
-            char *rt = method_copyReturnType(m);
-            WXN_ALOG(@"已挂 %@ 返回类型=%s", name, (rt ? rt : "?"));
-            free(rt);
-            gOrigMap[name] = [NSValue valueWithPointer:orig];
-            method_setImplementation(m, (IMP)WXNMsgHook2);
-        }
-        if (![gHookNames containsObject:name]) [gHookNames addObject:name];
-        any = YES;
-    }
-
-    {
-        // 2.31：未读变更事件——钩它做角标同步（忠实转发）
-        Method mu = class_getInstanceMethod(cls, NSSelectorFromString(@"AsyncOnUnReadChange:"));
-        if (mu) {
-            IMP origU = method_getImplementation(mu);
-            if (origU != (IMP)WXNUnReadChangeHook) {
-                gOrigUnReadChange = origU;
-                method_setImplementation(mu, (IMP)WXNUnReadChangeHook);
-                WXN_ALOG(@"已挂 AsyncOnUnReadChange:（角标同步）");
-            }
-        } else {
-            WXN_ALOG(@"没有 AsyncOnUnReadChange:，角标同步走离开时兜底");
-        }
-    }
-    NSString *three = @"AsyncOnAddMsgForSession:MsgWrap:NewMsgArriveNotify:";
-    {
-        Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(three));
-        if (m3) {
-            char *rt = method_copyReturnType(m3);
-            WXN_ALOG(@"[类型侦察] %@ 返回类型=%s", three, (rt ? rt : "?"));
-            free(rt);
-        }
-    }
-    any |= WXNSwizzle(cls, three, (IMP)WXNForSessionNotify, &gOrigForSessionNotify);
-    if (gOrigForSessionNotify && ![gHookNames containsObject:three]) [gHookNames addObject:three];
-
-    // 2.34：角标真链探针（NotificationActionsMgr）
-    {
-        Class nam = NSClassFromString(@"NotificationActionsMgr");
-        if (!nam) {
-            WXN_ALOG(@"[角标探针] 没有 NotificationActionsMgr");
-        } else {
-            Method m1 = class_getInstanceMethod(nam, NSSelectorFromString(@"onAppIconTotalUnreadCountChange:"));
-            if (m1) {
-                IMP o1 = method_getImplementation(m1);
-                if (o1 != (IMP)WXNIconCountChangeHook) {
-                    gOrigIconCountChange = o1;
-                    method_setImplementation(m1, (IMP)WXNIconCountChangeHook);
-                    WXN_ALOG(@"[角标探针] 已挂 -onAppIconTotalUnreadCountChange:");
-                }
-            } else {
-                WXN_ALOG(@"[角标探针] 没有 -onAppIconTotalUnreadCountChange:");
-            }
-            Method m2 = class_getClassMethod(nam, NSSelectorFromString(@"setApplicationIconBadgeNumber:"));
-            if (m2) {
-                IMP o2 = method_getImplementation(m2);
-                if (o2 != (IMP)WXNBadgeSetHook) {
-                    gOrigBadgeSet = o2;
-                    method_setImplementation(m2, (IMP)WXNBadgeSetHook);
-                    WXN_ALOG(@"[角标探针] 已挂 +setApplicationIconBadgeNumber:");
-                }
-            } else {
-                WXN_ALOG(@"[角标探针] 没有 +setApplicationIconBadgeNumber:");
-            }
-        }
-    }
-    // 2.36：清零路径探针
-    {
-        Class ad = NSClassFromString(@"MicroMessengerAppDelegate");
-        Method m3 = ad ? class_getInstanceMethod(ad, NSSelectorFromString(@"closeMainFrameWithoutReset")) : NULL;
-        if (m3) {
-            IMP o3 = method_getImplementation(m3);
-            if (o3 != (IMP)WXNCloseMainFrameHook) {
-                gOrigCloseMainFrame = o3;
-                method_setImplementation(m3, (IMP)WXNCloseMainFrameHook);
-                WXN_ALOG(@"[角标探针] 已挂 -closeMainFrameWithoutReset");
-            }
-        } else {
-            WXN_ALOG(@"[角标探针] 没有 -closeMainFrameWithoutReset（ad=%@）",
-                     ad ? @"有" : @"无");
-        }
-    }
-
-    // 2.55：读事件旗子——挂 ClearUnRead:FromID:ToID:
-    {
-        Method mc = class_getInstanceMethod(cls, NSSelectorFromString(@"ClearUnRead:FromID:ToID:"));
-        if (mc) {
-            IMP oc = method_getImplementation(mc);
-            if (oc != (IMP)WXNClearUnReadHook) {
-                gOrigClearUnRead = oc;
-                method_setImplementation(mc, (IMP)WXNClearUnReadHook);
-                WXN_ALOG(@"[角标] 已挂 ClearUnRead:FromID:ToID:");
-            }
-        } else {
-            WXN_ALOG(@"[角标] 没有 ClearUnRead:FromID:ToID:");
-        }
-    }
-
-    return any;
-}
-
-// 2.12：跟着 SpringBoard 的状态文件走。手指不再参与判断，
-// 但“人回到微信”这件事还得知道——用来清角标、写一条“回来了”的日志。
-static BOOL gWasInWeChat = NO;
-
-// 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
-// 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
-// 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
-// 2.40：诚实窗口已被实证证伪（两轮离开窗口内微信零动作，回调型感知），
-// 撤掉等待，离开即刻代笔；采样失败必须打出异常详情（不能再吞）。
-// 2.41：8.0.80 实锤——无参 GetUnReadCount 不存在（unrecognized selector），
-// 方法清单里是带参的 GetUnReadCount:。按候选顺序试，命中即缓存不再重复试。
-// 2.42：GetUnReadCount:(0) 口径存疑（有未读时也返 0）——离开时全变体测量
-// 打日志，锁定正确口径前保守写：只有变体 >0 才写角标，全 0 不碰（不再把
-// 微信自己写好的未读角标清掉）。
-static NSInteger gUnreadSelIdx = -1;   // -1=未定 0=GetUnReadCount: 1=无参 2=GetUnReadCount:CreateTimeLargerThan:
-static NSInteger WXNTryUnreadVariants(id obj) {
-    @try {
-        if (gUnreadSelIdx == 0 || gUnreadSelIdx == -1) {
-            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL, NSInteger))objc_msgSend)(obj, @selector(GetUnReadCount:), (NSInteger)0);
-            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 0; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount: -> %ld", (long)v); }
-            return v;
-        }
-    } @catch (NSException *e) {
-        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount: 不通：%@", e.reason);
-    }
-    @try {
-        if (gUnreadSelIdx == 1 || gUnreadSelIdx == -1) {
-            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(obj, @selector(GetUnReadCount));
-            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 1; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount -> %ld", (long)v); }
-            return v;
-        }
-    } @catch (NSException *e) {
-        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount 不通：%@", e.reason);
-    }
-    @try {
-        if (gUnreadSelIdx == 2 || gUnreadSelIdx == -1) {
-            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL, NSInteger, NSInteger))objc_msgSend)(obj, @selector(GetUnReadCount:CreateTimeLargerThan:), (NSInteger)0, (NSInteger)0);
-            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 2; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount:CreateTimeLargerThan: -> %ld", (long)v); }
-            return v;
-        }
-    } @catch (NSException *e) {
-        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount:CreateTimeLargerThan: 不通：%@", e.reason);
-    }
-    return -1;
-}
-static NSInteger WXNTryUnread(id obj) {
-    if (!obj) return -1;
-    return WXNTryUnreadVariants(obj);
-static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n) {
-    // 2.39：诚实窗口期内微信自己写角标 = 原生清理链跑起来了，记下来
-    gWeChatWroteBadge = YES;
-    WXN_ALOG(@"[角标探针] +setApplicationIconBadgeNumber:%ld（%@）", (long)n,
-             self ? NSStringFromClass((Class)self) : @"?");
-    if (gOrigBadgeSet) ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)(self, _cmd, n);
-}
-
-// 2.36：清零路径探针——只记触发与当时认知，不干预
-static void WXNCloseMainFrameHook(id self, SEL _cmd) {
-    WXN_ALOG(@"[角标探针] closeMainFrameWithoutReset 触发 self=%@ 认知后台=%d",
-             self ? NSStringFromClass(object_getClass(self)) : @"?",
-             (int)WXNReadLNBG());
-    if (gOrigCloseMainFrame) ((void (*)(id, SEL))gOrigCloseMainFrame)(self, _cmd);
-}
-
-// 2.30：未读数侦察——找微信内部"总未读"的真实来源，
-// 给角标跟未读同步做证据。只在 debug 开时跑一次。
-static void WXNDiagUnread(void) {
-    @autoreleasepool {
-        Class mgr = NSClassFromString(@"CMessageMgr");
-        if (!mgr) { WXN_ALOG(@"[未读侦察] 没有 CMessageMgr"); return; }
-        id center = WXNServiceCenter();
-        id inst = nil;
-        if (center && [center respondsToSelector:@selector(getService:)]) {
-            @try { inst = ((id (*)(id, SEL, Class))objc_msgSend)(center, @selector(getService:), mgr); }
-            @catch (__unused NSException *e) { inst = nil; }
-        }
-        WXN_ALOG(@"[未读侦察] 实例=%@", inst ? NSStringFromClass(object_getClass(inst)) : @"nil");
-        unsigned int n = 0;
-        Method *ms = class_copyMethodList(mgr, &n);
-        NSMutableArray *hits = [NSMutableArray array];
-        for (unsigned int i = 0; i < n; i++) {
-            NSString *name = NSStringFromSelector(method_getName(ms[i]));
-            NSString *low = name.lowercaseString;
-            if ([low containsString:@"unread"] || [low containsString:@"nread"]) [hits addObject:name];
-        }
-        free(ms);
-        WXN_ALOG(@"[未读侦察] CMessageMgr 方法命中 %lu 个：%@", (unsigned long)hits.count,
-                 WXNTrim([hits componentsJoinedByString:@", "], 600) ?: @"(无)");
-        if (!inst) { WXN_ALOG(@"[未读侦察] 没有实例，ivar 与试调跳过"); return; }
-        unsigned int iv = 0;
-        Ivar *ivs = class_copyIvarList(mgr, &iv);
-        NSMutableArray *ihits = [NSMutableArray array];
-        for (unsigned int i = 0; i < iv; i++) {
-            const char *nm = ivar_getName(ivs[i]);
-            if (!nm) continue;
-            NSString *name = @(nm);
-            NSString *low = name.lowercaseString;
-            if ([low containsString:@"unread"] || [low containsString:@"nread"]) {
-                id v = object_getIvar(inst, ivs[i]);
-                [ihits addObject:[NSString stringWithFormat:@"%@=%@", name, v ?: @"nil"]];
-            }
-        }
-        free(ivs);
-        WXN_ALOG(@"[未读侦察] ivar 命中 %lu 个：%@", (unsigned long)ihits.count,
-                 WXNTrim([ihits componentsJoinedByString:@", "], 600) ?: @"(无)");
-        // 试调无参、名字像取数的
-        for (NSString *name in hits) {
-            if ([name containsString:@":"]) continue;
-            SEL sel = NSSelectorFromString(name);
-            if (![inst respondsToSelector:sel]) continue;
-            NSMethodSignature *sig = [inst methodSignatureForSelector:sel];
-            if (sig.numberOfArguments != 2) continue;
-            const char *rt = [sig methodReturnType];
-            if (rt[0] == 'Q' || rt[0] == 'q' || rt[0] == 'I' || rt[0] == 'i' || rt[0] == 'l') {
-                long long v = 0;
-                if (rt[0] == 'Q' || rt[0] == 'I') v = (long long)((unsigned long (*)(id, SEL))objc_msgSend)(inst, sel);
-                else v = ((long long (*)(id, SEL))objc_msgSend)(inst, sel);
-                WXN_ALOG(@"[未读侦察] 试调 %@ -> %lld", name, v);
-            }
-        }
-    }
+        WXN_ALOG(@"探针：人已离开微信，投一条测试通知，看横幅画不画得出来");
+        // 走和真实消息一样的路（翻认知 → 投递），所以它会响，不会静悄悄飘过去
+        WXNBeginFakeBackground(@"前台探针");
+        WXNPost([@"wxn-probe-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
+                @"前台探针", nil,
+                @"看到这条横幅，说明离开微信后能弹了。",
+                @"wxn-probe", nil, NO);
+    });
 }
 
 static void WXNWatchFront(void) {
@@ -2141,16 +1724,19 @@ static void WXNWatchFront(void) {
         if (in != gWasInWeChat) {
             gWasInWeChat = in;
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
-            if (!in) {
-                // 2.37：交还原主——触发微信原生退出清理链（清角标等），
-                // 不再自己写角标（WXNBadgeSyncToUnread 撤出离开路径）
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    WXNNativeExitCleanup();
-                });
-            }
             if (in) {
-                // 2.29：进微信不再清主屏角标——角标跟真实未读走，
-                // 由微信自己的未读同步逻辑管理（读了才会归零）
+                gEnteredWeChatAt = CFAbsoluteTimeGetCurrent();
+                WXNClearBadgeNow(@"回到微信", YES);
+            } else {
+                WXNProbeOnLeave();
+            }
+        }
+        if (in) {
+            // 清完还可能被贴回来（UNS 投递时带的角标数、微信自己的未读同步），
+            // 回来这 20 秒里每轮再压一次，压到 0 为止
+            double now = CFAbsoluteTimeGetCurrent();
+            if (gBadge != 0 || (gEnteredWeChatAt > 0 && now - gEnteredWeChatAt < 20.0)) {
+                WXNClearBadgeNow(@"回到微信（复查）", NO);
             }
         }
     } @catch (__unused NSException *e) {}
@@ -2190,7 +1776,40 @@ static void WXNSetupWithRetry(int attempt) {
 //   notifyutil -p cn.qwq.wxnotify.test
 // ---------------------------------------------------------------------------
 
+// 诊断：notifyutil -p cn.qwq.wxnotify.diag
+// 把环境、钩子、权限、Immortalizer 开关全写进日志文件
+static void WXNPostBootOnce(void) {
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (!docs.count) return;
+    NSString *marker = [docs[0] stringByAppendingPathComponent:
+                                   [@".wxn_boot_" stringByAppendingString:@WXN_VERSION]];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:marker]) return;
+    if (![@"1" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL]) return;
 
+    gForceNextBanner = YES;
+    NSString *where = WXNLogPath() ?: @"(日志没写成功)";
+    WXN_ALOG(@"首次启动，投一条自检通知：%@", where);
+
+    // 两条间隔 2 秒：一条在微信里（走 willPresent 强制），一条应当直接当普通通知弹
+    for (int i = 0; i < 2; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                           WXNPost([NSString stringWithFormat:@"wxn-boot-%d-%@", i,
+                                    [[NSUUID UUID] UUIDString]],
+                                   [NSString stringWithFormat:@"WxNotify %s 已加载", WXN_VERSION],
+                                   nil,
+                                   [NSString stringWithFormat:@"第 %d 条。收到消息会补发横幅。日志：%@",
+                                    i + 1, where],
+                                   @"wxn-boot", nil, NO);
+                       });
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       gForceNextBanner = NO;
+                   });
+}
 
 // 再补一层零风险的探针：只听系统广播，不改任何行为。
 // 注意：只有“离开”类广播才算证据（known=1），回来类广播满天飞（启动时就一堆），
@@ -2487,25 +2106,31 @@ static void WXNInit(void) {
         WXNLoadConfig();
     });
 
-    WXNInstallLocalNotificationProbe();
-    WXNInstallCognitionHooks();
+    if (!WXNMarkerOff("no_ln")) WXNInstallLocalNotificationProbe();
+    if (!WXNMarkerOff("no_cog")) WXNInstallCognitionHooks();
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *note) {
+        if (!WXNMarkerOff("no_badgeclear")) WXNClearBadgeNow(@"微信变成 active", YES);
+    }];
     WXNWatchFront();
-    WXNInstallWithRetry(0);
-    WXNSetupWithRetry(0);
+    if (!WXNMarkerOff("no_msg")) WXNInstallWithRetry(0);
+    if (!WXNMarkerOff("no_delegate")) WXNSetupWithRetry(0);
 
     // 8 秒补挂一次：有的版本类注册得晚，或者被别的插件盖回去了。
     // 自检通知只在这里、且只在 debug 打开时弹，日常版本一条都不弹。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       WXNInstallCognitionHooks();
-                       WXNSetupPresentationHooks();
+                       if (!WXNMarkerOff("no_cog")) WXNInstallCognitionHooks();
+                       if (!WXNMarkerOff("no_delegate")) WXNSetupPresentationHooks();
+                       if (WXNDebug()) WXNPostBootOnce();
                    });
 
     // 20 秒再补一次，顺便把可能还没起来的 MMLocalNotificationMgr 抓到手
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNTryGrabLN(@"启动 20 秒");
-                       if (WXNDebug()) WXNDiagUnread();
-                       WXNSetupPresentationHooks();
+                       if (!WXNMarkerOff("no_delegate")) WXNSetupPresentationHooks();
                    });
 }
