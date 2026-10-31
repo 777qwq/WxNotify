@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.40"
+#define WXN_VERSION     "2.41"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1727,17 +1727,42 @@ static BOOL gWasInWeChat = NO;
 // 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
 // 2.40：诚实窗口已被实证证伪（两轮离开窗口内微信零动作，回调型感知），
 // 撤掉等待，离开即刻代笔；采样失败必须打出异常详情（不能再吞）。
+// 2.41：8.0.80 实锤——无参 GetUnReadCount 不存在（unrecognized selector），
+// 方法清单里是带参的 GetUnReadCount:。按候选顺序试，命中即缓存不再重复试。
+static NSInteger gUnreadSelIdx = -1;   // -1=未定 0=GetUnReadCount: 1=无参 2=GetUnReadCount:CreateTimeLargerThan:
+static NSInteger WXNTryUnreadVariants(id obj) {
+    @try {
+        if (gUnreadSelIdx == 0 || gUnreadSelIdx == -1) {
+            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL, NSInteger))objc_msgSend)(obj, @selector(GetUnReadCount:), (NSInteger)0);
+            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 0; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount: -> %ld", (long)v); }
+            return v;
+        }
+    } @catch (NSException *e) {
+        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount: 不通：%@", e.reason);
+    }
+    @try {
+        if (gUnreadSelIdx == 1 || gUnreadSelIdx == -1) {
+            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(obj, @selector(GetUnReadCount));
+            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 1; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount -> %ld", (long)v); }
+            return v;
+        }
+    } @catch (NSException *e) {
+        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount 不通：%@", e.reason);
+    }
+    @try {
+        if (gUnreadSelIdx == 2 || gUnreadSelIdx == -1) {
+            NSInteger v = (NSInteger)((unsigned int (*)(id, SEL, NSInteger, NSInteger))objc_msgSend)(obj, @selector(GetUnReadCount:CreateTimeLargerThan:), (NSInteger)0, (NSInteger)0);
+            if (gUnreadSelIdx == -1) { gUnreadSelIdx = 2; WXN_ALOG(@"[未读采样] 命中 GetUnReadCount:CreateTimeLargerThan: -> %ld", (long)v); }
+            return v;
+        }
+    } @catch (NSException *e) {
+        if (gUnreadSelIdx == -1) WXN_ALOG(@"[未读采样] GetUnReadCount:CreateTimeLargerThan: 不通：%@", e.reason);
+    }
+    return -1;
+}
 static NSInteger WXNTryUnread(id obj) {
     if (!obj) return -1;
-    // 2.33：不信 respondsToSelector——MMServiceWrapper 靠 ObjC 转发响应服务方法，
-    // 问它"有没有"永远是 NO，直接发，转发机制自己会兜
-    @try {
-        return (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(obj, @selector(GetUnReadCount));
-    } @catch (NSException *e) {
-        WXN_ALOG(@"[未读采样] GetUnReadCount 异常 obj=%@ reason=%@",
-                 NSStringFromClass(object_getClass(obj)), e);
-        return -1;
-    }
+    return WXNTryUnreadVariants(obj);
 }
 
 static id gMsgMgrReal = nil;
