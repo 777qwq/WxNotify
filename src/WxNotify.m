@@ -1313,6 +1313,7 @@ static void WXNCognitionForce(BOOL bg) {
 static NSInteger WXNUnreadTotal(void);
 static IMP gOrigBadgeSet;            // 2.39 前向引用（声明在 WXNInstall 段）
 static id gNAMInstance;              // 2.43 前向引用
+static NSInteger gNAMCount = -1;     // 2.45 前向引用
 // 2.39：诚实窗口——离开时停 2 秒干预，让微信自己的监控撞上真实状态、
 // 走原生退出清理链。2 秒后看探针：微信自己写过角标就收手，没写才代笔。
 static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角标
@@ -1836,7 +1837,6 @@ static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
 // 2.45：反汇编实锤——onAppIconTotalUnreadCountChange: 的参数 x2 就是总未读数
 // （方法内 mov x19,x2 … cmp applicationState,#2 … setApplicationIconBadgeNumber:(x19)）。
 // 钩子直接捕获它，退出时写这个值 = 微信自己的口径。
-static NSInteger gNAMCount = -1;
 static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
     if (self && !gNAMInstance) gNAMInstance = self;
     gNAMCount = (NSInteger)(uintptr_t)a1;
