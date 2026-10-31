@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.52"
+#define WXN_VERSION     "2.53"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -891,6 +891,21 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
     // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
     if (!WXNShouldNotify()) {
         WXN_ALOG(@"  跳过：前台判断为“人在微信里”");
+        // 2.53：前台来消息（非自己发）= 未读 +1（微信不写角标，我们自己记账）
+        Class wrapCls2 = NSClassFromString(@"CMessageWrap");
+        BOOL isSender = NO;
+        if (wrapCls2 && [(id)wrapCls2 respondsToSelector:@selector(isSenderFromMsgWrap:)]) {
+            @try { isSender = ((BOOL (*)(id, SEL, id))objc_msgSend)((id)wrapCls2, @selector(isSenderFromMsgWrap:), wrap); }
+            @catch (__unused NSException *e) {}
+        }
+        if (!isSender) {
+            NSString *sess = rawChat.length ? rawChat : rawFrom;
+            if (sess.length) {
+                gNAMCount += 1;
+                gSessionUnread[sess] = @([gSessionUnread[sess] integerValue] + 1);
+                WXN_ALOG(@"  [计数] 前台来消息 %ld（会话 %@ 记账 %d）", (long)gNAMCount, sess, [gSessionUnread[sess] intValue]);
+            }
+        }
         return;
     }
 
@@ -1315,6 +1330,11 @@ static IMP gOrigBadgeSet;            // 2.39 前向引用（声明在 WXNInstall
 static id gNAMInstance;              // 2.43 前向引用
 static NSInteger gNAMCount = -1;     // 2.45 前向引用
 static void WXNDumpNAMIvars(void);   // 2.51 前向引用
+// 2.53：会话级记账——前台来消息 gNAMCount+1 并记会话债，ClearUnRead 时还债。
+// 解决「前台读消息不触发 onAppIconTotalUnreadCountChange 回调」的计数过期问题。
+static NSMutableDictionary *gSessionUnread = nil;
+static IMP gOrigClearUnRead = nil;
+static void WXNClearUnReadHook(id self, SEL _cmd, id from, id to);
 // 2.39：诚实窗口——离开时停 2 秒干预，让微信自己的监控撞上真实状态、
 // 走原生退出清理链。2 秒后看探针：微信自己写过角标就收手，没写才代笔。
 static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角标
@@ -1731,6 +1751,22 @@ static BOOL WXNInstall(void) {
         }
     }
 
+    // 2.53：会话级记账——挂 ClearUnRead:FromID:ToID:
+    if (!gSessionUnread) gSessionUnread = [NSMutableDictionary dictionary];
+    {
+        Method mc = class_getInstanceMethod(cls, NSSelectorFromString(@"ClearUnRead:FromID:ToID:"));
+        if (mc) {
+            IMP oc = method_getImplementation(mc);
+            if (oc != (IMP)WXNClearUnReadHook) {
+                gOrigClearUnRead = oc;
+                method_setImplementation(mc, (IMP)WXNClearUnReadHook);
+                WXN_ALOG(@"[计数] 已挂 ClearUnRead:FromID:ToID:");
+            }
+        } else {
+            WXN_ALOG(@"[计数] 没有 ClearUnRead:FromID:ToID:");
+        }
+    }
+
     return any;
 }
 
@@ -1832,7 +1868,31 @@ static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
     // 2.52：拆掉 BadSync——GetUnReadCount: 口径错误（有未读也返 0），每次回微信
     // 都把微信写好的角标清掉，是「没读被清/读完不清」混乱的真正元凶。
     // 回调只留转发，不再写角标。
+    // 2.53：后台链路的未读变化会走 NAM 回调锚定计数；这里把会话债清掉
+    //（后台同步也会清会话未读，防止重复还债）。
     if (gOrigUnReadChange) ((void (*)(id, SEL, id))gOrigUnReadChange)(self, _cmd, a1);
+    if ([gSessionUnread count]) {
+        WXN_ALOG(@"[计数] UnReadChange：清空会话债（%@）", gSessionUnread);
+        [gSessionUnread removeAllObjects];
+    }
+}
+
+// 2.53：用户在微信里读掉一个会话 → 还债
+static void WXNClearUnReadHook(id self, SEL _cmd, id from, id to) {
+    if (gOrigClearUnRead) ((void (*)(id, SEL, id, id))gOrigClearUnRead)(self, _cmd, from, to);
+    NSString *sess = [from isKindOfClass:[NSString class]] ? from : nil;
+    NSInteger debt = sess ? [gSessionUnread[sess] integerValue] : 0;
+    if (debt > 0) {
+        gNAMCount -= debt;
+        gSessionUnread[sess] = @0;
+        WXN_ALOG(@"[计数] ClearUnRead 还债 %ld（会话 %@）→ 总未读 %ld", (long)debt, sess, (long)gNAMCount);
+    } else if (sess) {
+        // 读的会话没记过账（后台来的消息或微信自己的未读）：计数变脏
+        if (gNAMCount > 0) {
+            gNAMCount = -1;
+            WXN_ALOG(@"[计数] ClearUnRead 会话 %@ 无账可还，计数标脏（退出不写）", sess);
+        }
+    }
 }
 
 // 2.34：角标真链探针
