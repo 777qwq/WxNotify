@@ -699,6 +699,9 @@ static NSString *WXNSelfUsr(void) {
 
 // 用系统原生的「通讯通知」把横幅画成微信那种带头像的样子。
 // 全部走运行时反射，任何一步对不上就安静退回普通通知，绝不崩。
+// 2.53 前向引用（会话级记账，定义在 WXNInstall 段）
+static NSInteger gNAMCount;
+static NSMutableDictionary *gSessionUnread;
 static UNNotificationContent *WXNCommunicationContent(UNNotificationContent *base,
                                                       NSString *senderUsr,
                                                       NSString *senderName,
