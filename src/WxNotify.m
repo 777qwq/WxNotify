@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.50"
+#define WXN_VERSION     "2.51"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1371,6 +1371,8 @@ static void WXNNativeExitCleanup(void) {
         WXN_ALOG(@"[ivar倾倒真身%@] %@", i>0 ? @"续" : @"", [dump substringWithRange:r]);
     }
     // 总未读写入暂停，等真身 ivar 表锁定
+    // 2.51：顺手把 NAM 单例的 ivar 表也倒出来
+    WXNDumpNAMIvars();
 }
 
 static void WXNCognitionRestore(void) {
@@ -1898,6 +1900,37 @@ static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
         }
     }
     if (gOrigIconCountChange) ((void (*)(id, SEL, void *))gOrigIconCountChange)(self, _cmd, a1);
+}
+
+// 2.51：倾倒 NAM 单例 ivar 表——计数累加器的宿主，找总未读字段
+static void WXNDumpNAMIvars(void) {
+    if (!gNAMInstance) { WXN_ALOG(@"[ivar倾倒NAM] 单例未抓到"); return; }
+    unsigned int n = 0;
+    Ivar *ivs = class_copyIvarList(object_getClass(gNAMInstance), &n);
+    NSMutableString *dump = [NSMutableString string];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivs[i]);
+        ptrdiff_t off = ivar_getOffset(ivs[i]);
+        const char *ty = ivar_getTypeEncoding(ivs[i]);
+        void *base = (char *)(__bridge void *)gNAMInstance + off;
+        NSString *shown = @"?";
+        if (ty && (ty[0]=='q'||ty[0]=='l'||ty[0]=='i')) {
+            shown = [NSString stringWithFormat:@"%lld", (long long)(ty[0]=='i' ? *(int*)base : *(long long*)base)];
+        } else if (ty && (ty[0]=='Q'||ty[0]=='L'||ty[0]=='I')) {
+            shown = [NSString stringWithFormat:@"%llu", (unsigned long long)(ty[0]=='I' ? *(unsigned int*)base : *(unsigned long long*)base)];
+        } else if (ty && ty[0]=='@') {
+            void *p = *(void**)base;
+            shown = p ? NSStringFromClass(object_getClass((__bridge id)p)) : @"nil";
+        } else if (ty && ty[0]=='B') {
+            shown = (*(BOOL*)base) ? @"YES" : @"NO";
+        }
+        [dump appendFormat:@"%s@%ld=%@|", nm ? nm : "?", (long)off, shown];
+    }
+    if (ivs) free(ivs);
+    for (NSInteger i = 0; i < (NSInteger)((dump.length + 1199) / 1200); i++) {
+        NSRange r = NSMakeRange(i*1200, MIN(1200, dump.length - i*1200));
+        WXN_ALOG(@"[ivar倾倒NAM%@] %@", i>0 ? @"续" : @"", [dump substringWithRange:r]);
+    }
 }
 
 static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n) {
