@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.43"
+#define WXN_VERSION     "2.44"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1225,12 +1225,19 @@ static void WXNHookDelegateClass(Class cls) {
 @end
 
 static IMP gOrigSetDelegate;
+static id gNAMInstance;   // 2.44 前向引用（声明在 WXNInstall 段）
 
 static void WXNSetDelegate(id self, SEL _cmd, id delegate) {
     if (gOrigSetDelegate) ((void (*)(id, SEL, id))gOrigSetDelegate)(self, _cmd, delegate);
     if (delegate) {
         WXN_ALOG(@"UNUserNotificationCenter 换了代理：%@",
                  NSStringFromClass(object_getClass(delegate)));
+        // 2.44：NotificationActionsMgr 当代理的瞬间抓单例——总未读 ivar 的宿主
+        Class nam = NSClassFromString(@"NotificationActionsMgr");
+        if (nam && [delegate isKindOfClass:nam] && !gNAMInstance) {
+            gNAMInstance = delegate;
+            WXN_ALOG(@"[退出清理] 已抓到 NAM 单例（setDelegate）");
+        }
         WXNHookDelegateClass(object_getClass(delegate));
     }
 }
