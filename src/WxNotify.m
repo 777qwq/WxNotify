@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.38"
+#define WXN_VERSION     "2.39"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1304,26 +1304,32 @@ static void WXNCognitionForce(BOOL bg) {
 }
 
 static NSInteger WXNUnreadTotal(void);
-// 2.38：外科手术版——2.37 直接调 closeMainFrameWithoutReset 会拆主界面状态，
-// 强杀退出时微信二次走退出流程撞死锁（0x8BADF00D watchdog）。改为只复刻
-// 退出链对角标的那个动作：用微信自己的未读计数写一次角标（原生清零+未读
-// 同步的最终效果 = 角标=当前未读数），不碰 UI 状态。
+// 2.39：诚实窗口——离开时停 2 秒干预，让微信自己的监控撞上真实状态、
+// 走原生退出清理链。2 秒后看探针：微信自己写过角标就收手，没写才代笔。
+static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角标
 static void WXNNativeExitCleanup(void) {
     if (!gLN || !gLNIsBG) return;           // 认知干预没启用就不碰
     WXNCognitionForce(YES);                  // 复位成真实后台
-    long unread = (long)WXNUnreadTotal();
-    if (unread < 0) unread = 0;              // 采样失败按原生清零处理
-    Class nam = NSClassFromString(@"NotificationActionsMgr");
-    if (!nam || !gOrigBadgeSet) {
-        WXN_ALOG(@"[退出清理] NotificationActionsMgr 探针未就绪，跳过");
-        return;
-    }
-    WXN_ALOG(@"[退出清理] 离开事件 → 原生角标写 %ld（微信自己的未读计数）", unread);
-    @try {
-        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), (NSInteger)unread);
-    } @catch (NSException *e) {
-        WXN_ALOG(@"[退出清理] 异常 %@", e);
-    }
+    gWeChatWroteBadge = NO;
+    WXN_ALOG(@"[退出清理] 诚实窗口开启 2s（等微信自己清）");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       WXNCognitionForce(NO);   // 恢复保活伪装
+                       if (gWeChatWroteBadge) {
+                           WXN_ALOG(@"[退出清理] 微信窗口期内自己写了角标，收手");
+                           return;
+                       }
+                       long unread = (long)WXNUnreadTotal();
+                       if (unread < 0) unread = 0;
+                       Class nam = NSClassFromString(@"NotificationActionsMgr");
+                       if (!nam || !gOrigBadgeSet) return;
+                       WXN_ALOG(@"[退出清理] 微信没动，代笔：角标写 %ld", unread);
+                       @try {
+                           ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), (NSInteger)unread);
+                       } @catch (NSException *e) {
+                           WXN_ALOG(@"[退出清理] 异常 %@", e);
+                       }
+                   });
 }
 
 static void WXNCognitionRestore(void) {
@@ -1797,6 +1803,8 @@ static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
 }
 
 static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n) {
+    // 2.39：诚实窗口期内微信自己写角标 = 原生清理链跑起来了，记下来
+    gWeChatWroteBadge = YES;
     WXN_ALOG(@"[角标探针] +setApplicationIconBadgeNumber:%ld（%@）", (long)n,
              self ? NSStringFromClass((Class)self) : @"?");
     if (gOrigBadgeSet) ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)(self, _cmd, n);
