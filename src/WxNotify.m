@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.58"
+#define WXN_VERSION     "2.59"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1178,11 +1178,7 @@ static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOr
 
 static IMP gOrigWillPresent;
 
-// 自检通知要能当面弹出来（用户这时往往就在微信里），单独给一个开关
-static BOOL gForceNextBanner = NO;
-
 static BOOL WXNForcePresentation(void) {
-    if (gForceNextBanner) return YES;
     return !WXNInWeChatSafe(NULL);
 }
 
@@ -1207,14 +1203,14 @@ static void WXNWillPresent(id self, SEL _cmd, id center, id notification,
     double now = CFAbsoluteTimeGetCurrent();
     BOOL faked = (now < gFakeUntil);
     NSString *why = nil;
-    BOOL inWeChat = !gForceNextBanner && !faked && WXNInWeChatSafe(&why);
+    BOOL inWeChat = !faked && WXNInWeChatSafe(&why);
 
     // 系统只在"它认为微信在前台"时才调这里。所以这里的判断就是最后一道闸：
     // 人在微信里 -> 静默（横幅、声音、角标全不要），跟原生前台行为一致；
     // 人不在微信里（或这条是我们刚翻出来的）-> 给足横幅+声音+角标。
-    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 刚翻的=%d 强制=%d（%@）",
+    WXN_ALOG(@"[willPresent] 进入 %@ 在微信里=%d 刚翻的=%d（%@）",
              NSStringFromClass(object_getClass(self)), (int)inWeChat, (int)faked,
-             (int)gForceNextBanner, why ?: @"(无)");
+             why ?: @"(无)");
 
     if (inWeChat) {
         // 2.23：人在微信里 -> 原实现奉还。8.0.80 的前台提示音就走在微信自己的
@@ -1697,63 +1693,6 @@ static BOOL WXNInstall(void) {
 static BOOL gWasInWeChat = NO;
 static double gEnteredWeChatAt = 0;
 
-// 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
-// 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
-// 只在 debug 打开时探，两分钟最多一条，别刷屏。
-static double gLastProbeAt = 0;
-
-static void WXNProbeOnLeave(void) {
-    // 2.57：MMKV 账本探针——真身 m_pushInfos（MemoryMappedKV）的条目数
-    // 可能就是未读数（按会话持久化的待推送账本，读掉会清条目）。
-    @try {
-        if (!gLN) { WXN_ALOG(@"[MMKV] LN 未就绪"); return; }
-        id real = gLN;
-        Class realCls = NSClassFromString(@"MMLocalNotificationMgr");
-        if (![real isKindOfClass:realCls]) {
-            id inner = nil;
-            unsigned int n = 0;
-            Ivar *ivs = class_copyIvarList(object_getClass(gLN), &n);
-            for (unsigned int i = 0; i < n; i++) {
-                const char *nm = ivar_getName(ivs[i]);
-                if (nm && strcmp(nm, "m_service") == 0) {
-                    inner = object_getIvar(gLN, ivs[i]);
-                    break;
-                }
-            }
-            if (ivs) free(ivs);
-            if (inner && [inner isKindOfClass:realCls]) real = inner;
-            else { WXN_ALOG(@"[MMKV] 真身解引用失败"); return; }
-        }
-        Ivar kvIvar = class_getInstanceVariable(realCls, "m_pushInfos");
-        if (!kvIvar) { WXN_ALOG(@"[MMKV] 没有 m_pushInfos"); return; }
-        id kv = object_getIvar(real, kvIvar);
-        if (!kv) { WXN_ALOG(@"[MMKV] pushInfos 为 nil"); return; }
-        unsigned long c = ((unsigned long (*)(id, SEL))objc_msgSend)(kv, @selector(count));
-        WXN_ALOG(@"[MMKV] pushInfos 条目数 = %lu", c);
-        // 2.58：抓前 3 个键对应的条目，看有没有每会话未读字段
-        NSMutableArray *keys = [NSMutableArray array];
-        void (^enumBlk)(NSString *, BOOL *) = ^(NSString *k, BOOL *stop) {
-            if (k.length && keys.count < 3) [keys addObject:k];
-            if (keys.count >= 3) *stop = YES;
-        };
-        @try {
-            ((void (*)(id, SEL, id))objc_msgSend)(kv, @selector(enumerateKeys:), enumBlk);
-        } @catch (NSException *e) { WXN_ALOG(@"[MMKV] enumerateKeys 异常 %@", e); }
-        for (NSString *k in keys) {
-            id obj = nil;
-            @try {
-                obj = ((id (*)(id, SEL, Class, id))objc_msgSend)(kv, @selector(getObjectOfClass:forKey:),
-                                                                 [NSObject class], k);
-            } @catch (NSException *e) { WXN_ALOG(@"[MMKV] objectForKey 异常 %@", e); }
-            NSString *desc = obj ? [obj description] : @"(nil)";
-            if (desc.length > 400) desc = [desc substringToIndex:400];
-            WXN_ALOG(@"[MMKV] 键 %@ -> %@", k, desc);
-        }
-    } @catch (NSException *e) {
-        WXN_ALOG(@"[MMKV] 异常 %@", e);
-    }
-}
-
 static void WXNWatchFront(void) {
     @try {
         NSString *why = nil;
@@ -1776,7 +1715,6 @@ static void WXNWatchFront(void) {
                     WXN_ALOG(@"离开微信：微信内未读 %ld 写上角标（总 %ld）", (long)gInAppUnread, (long)gBadge);
                     gInAppUnread = 0;
                 }
-                WXNProbeOnLeave();
             }
         }
         if (in) {
@@ -1818,14 +1756,6 @@ static void WXNSetupWithRetry(int attempt) {
                        WXNSetupWithRetry(attempt + 1);
                    });
 }
-
-// ---------------------------------------------------------------------------
-// 自检：发一条测试通知，确认 UNS 那一半也开了
-//   notifyutil -p cn.qwq.wxnotify.test
-// ---------------------------------------------------------------------------
-
-// 诊断：notifyutil -p cn.qwq.wxnotify.diag
-// 把环境、钩子、权限、Immortalizer 开关全写进日志文件
 
 // 再补一层零风险的探针：只听系统广播，不改任何行为。
 // 注意：只有“离开”类广播才算证据（known=1），回来类广播满天飞（启动时就一堆），
