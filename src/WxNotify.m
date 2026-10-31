@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.45"
+#define WXN_VERSION     "2.46"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1842,6 +1842,23 @@ static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
     gNAMCount = (NSInteger)(uintptr_t)a1;
     WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 未读数=%ld self=%@",
              (long)gNAMCount, self ? NSStringFromClass(object_getClass(self)) : @"?");
+    // 2.46：8.0.79 存根显示 self->0x20 = 计数数组指针（按类型索引取值）。
+    // 倾倒前 16 个 int，对照参数找"总和"在哪个格子。
+    if (self) {
+        void *arr = *(void **)((char *)(__bridge void *)self + 0x20);
+        if (arr) {
+            NSInteger s = 0;
+            NSMutableString *dump = [NSMutableString string];
+            for (int i = 0; i < 16; i++) {
+                unsigned int v = *(unsigned int *)((char *)arr + i * 4);
+                s += (NSInteger)(int)v;
+                [dump appendFormat:@"%d,", (int)v];
+            }
+            WXN_ALOG(@"[角标探针] 计数数组=%@ sum=%ld", dump, (long)s);
+        } else {
+            WXN_ALOG(@"[角标探针] 计数数组指针为空");
+        }
+    }
     if (gOrigIconCountChange) ((void (*)(id, SEL, void *))gOrigIconCountChange)(self, _cmd, a1);
 }
 
