@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.49"
+#define WXN_VERSION     "2.50"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1318,9 +1318,9 @@ static NSInteger gNAMCount = -1;     // 2.45 前向引用
 // 走原生退出清理链。2 秒后看探针：微信自己写过角标就收手，没写才代笔。
 static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角标
 static void WXNNativeExitCleanup(void) {
-    // 2.49：ivar 倾倒实锤——gLN 是 MMServiceWrapper 容器（m_service@8 指向真身）！
-    // 之前所有 0x40 读取都在读容器的垃圾内存。解出真身 MMLocalNotificationMgr
-    // 再读 0x40（本地推送 badge 同源，8.0.79 反汇编实锤）。
+    // 2.50：0x40 在 8.0.80 里是指向另一个 MMLocalNotificationMgr 的指针（越界值
+    // 0x2A49FE300 实锤），不是计数。真身的 ivar 表从未倾倒过——这次倒真身，
+    // 按名字找未读字段（如 m_totalUnRead / m_unReadCount 之类）。
     if (!gLN) { WXN_ALOG(@"[退出清理] LN 未就绪"); return; }
     id real = gLN;
     Class realCls = NSClassFromString(@"MMLocalNotificationMgr");
@@ -1338,28 +1338,39 @@ static void WXNNativeExitCleanup(void) {
         if (ivs) free(ivs);
         if (inner && [inner isKindOfClass:realCls]) {
             real = inner;
-            WXN_ALOG(@"[退出清理] 解引用 m_service → 真身 %@",
-                     NSStringFromClass(object_getClass(real)));
         } else {
-            WXN_ALOG(@"[退出清理] m_service 解引用失败（inner=%@）",
-                     inner ? NSStringFromClass(object_getClass(inner)) : @"nil");
+            WXN_ALOG(@"[退出清理] m_service 解引用失败");
             return;
         }
     }
-    long long v = *(long long *)((char *)(__bridge void *)real + 0x40);
-    WXN_ALOG(@"[退出清理] 真身 ivar0x40 = %lld", v);
-    if (v < 0 || v > 999) {
-        WXN_ALOG(@"[退出清理] 数值越界，不动角标");
-        return;
+    WXN_ALOG(@"[ivar倾倒真身 %@ %p]", NSStringFromClass(object_getClass(real)), real);
+    unsigned int n = 0;
+    Ivar *ivs = class_copyIvarList(object_getClass(real), &n);
+    NSMutableString *dump = [NSMutableString string];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivs[i]);
+        ptrdiff_t off = ivar_getOffset(ivs[i]);
+        const char *ty = ivar_getTypeEncoding(ivs[i]);
+        void *base = (char *)(__bridge void *)real + off;
+        NSString *shown = @"?";
+        if (ty && (ty[0]=='q'||ty[0]=='l'||ty[0]=='i')) {
+            shown = [NSString stringWithFormat:@"%lld", (long long)(ty[0]=='i' ? *(int*)base : *(long long*)base)];
+        } else if (ty && (ty[0]=='Q'||ty[0]=='L'||ty[0]=='I')) {
+            shown = [NSString stringWithFormat:@"%llu", (unsigned long long)(ty[0]=='I' ? *(unsigned int*)base : *(unsigned long long*)base)];
+        } else if (ty && ty[0]=='@') {
+            void *p = *(void**)base;
+            shown = p ? NSStringFromClass(object_getClass((__bridge id)p)) : @"nil";
+        } else if (ty && ty[0]=='B') {
+            shown = (*(BOOL*)base) ? @"YES" : @"NO";
+        }
+        [dump appendFormat:@"%s@%ld=%@|", nm ? nm : "?", (long)off, shown];
     }
-    Class nam = NSClassFromString(@"NotificationActionsMgr");
-    if (!nam || !gOrigBadgeSet) return;
-    WXN_ALOG(@"[退出清理] 退出写总未读：角标 = %lld", v);
-    @try {
-        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), (NSInteger)v);
-    } @catch (NSException *e) {
-        WXN_ALOG(@"[退出清理] 异常 %@", e);
+    if (ivs) free(ivs);
+    for (NSInteger i = 0; i < (NSInteger)((dump.length + 1199) / 1200); i++) {
+        NSRange r = NSMakeRange(i*1200, MIN(1200, dump.length - i*1200));
+        WXN_ALOG(@"[ivar倾倒真身%@] %@", i>0 ? @"续" : @"", [dump substringWithRange:r]);
     }
+    // 总未读写入暂停，等真身 ivar 表锁定
 }
 
 static void WXNCognitionRestore(void) {
