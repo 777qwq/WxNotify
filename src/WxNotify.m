@@ -1336,15 +1336,6 @@ static void WXNNativeExitCleanup(void) {
         WXN_ALOG(@"[退出清理] 异常 %@", e);
     }
 }
-    Class nam = NSClassFromString(@"NotificationActionsMgr");
-    if (!nam || !gOrigBadgeSet) return;
-    WXN_ALOG(@"[退出清理] 退出写总未读：角标 = %ld", (long)gNAMCount);
-    @try {
-        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), gNAMCount);
-    } @catch (NSException *e) {
-        WXN_ALOG(@"[退出清理] 异常 %@", e);
-    }
-}
 
 static void WXNCognitionRestore(void) {
     WXNCognitionForce(NO);
