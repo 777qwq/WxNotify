@@ -1314,6 +1314,7 @@ static NSInteger WXNUnreadTotal(void);
 static IMP gOrigBadgeSet;            // 2.39 前向引用（声明在 WXNInstall 段）
 static id gNAMInstance;              // 2.43 前向引用
 static NSInteger gNAMCount = -1;     // 2.45 前向引用
+static void WXNDumpNAMIvars(void);   // 2.51 前向引用
 // 2.39：诚实窗口——离开时停 2 秒干预，让微信自己的监控撞上真实状态、
 // 走原生退出清理链。2 秒后看探针：微信自己写过角标就收手，没写才代笔。
 static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角标
