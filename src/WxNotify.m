@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.33"
+#define WXN_VERSION     "2.34"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1565,6 +1565,14 @@ static void WXNSetupPresentationHooks(void) {
 static IMP gOrigUnReadChange;   // 2.31
 static void WXNUnReadChangeHook(id self, SEL _cmd, id a1);
 
+// 2.34：8.0.79 静态分析实锤——角标真链在 NotificationActionsMgr，
+// 清零点在 -[MicroMessengerAppDelegate closeMainFrameWithoutReset]（"User exit"）。
+// 探针：只记日志不干预。用 IMP 直调转发，签名固定不依赖 method 编码。
+static IMP gOrigIconCountChange;    // 实例方法 onAppIconTotalUnreadCountChange:
+static IMP gOrigBadgeSet;           // 类方法   +setApplicationIconBadgeNumber:
+static void WXNIconCountChangeHook(id self, SEL _cmd, id note);
+static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n);
+
 static BOOL WXNInstall(void) {
     Class cls = NSClassFromString(@"CMessageMgr");
     if (!cls) return NO;
@@ -1636,6 +1644,37 @@ static BOOL WXNInstall(void) {
     any |= WXNSwizzle(cls, three, (IMP)WXNForSessionNotify, &gOrigForSessionNotify);
     if (gOrigForSessionNotify && ![gHookNames containsObject:three]) [gHookNames addObject:three];
 
+    // 2.34：角标真链探针（NotificationActionsMgr）
+    {
+        Class nam = NSClassFromString(@"NotificationActionsMgr");
+        if (!nam) {
+            WXN_ALOG(@"[角标探针] 没有 NotificationActionsMgr");
+        } else {
+            Method m1 = class_getInstanceMethod(nam, NSSelectorFromString(@"onAppIconTotalUnreadCountChange:"));
+            if (m1) {
+                IMP o1 = method_getImplementation(m1);
+                if (o1 != (IMP)WXNIconCountChangeHook) {
+                    gOrigIconCountChange = o1;
+                    method_setImplementation(m1, (IMP)WXNIconCountChangeHook);
+                    WXN_ALOG(@"[角标探针] 已挂 -onAppIconTotalUnreadCountChange:");
+                }
+            } else {
+                WXN_ALOG(@"[角标探针] 没有 -onAppIconTotalUnreadCountChange:");
+            }
+            Method m2 = class_getClassMethod(nam, NSSelectorFromString(@"setApplicationIconBadgeNumber:"));
+            if (m2) {
+                IMP o2 = method_getImplementation(m2);
+                if (o2 != (IMP)WXNBadgeSetHook) {
+                    gOrigBadgeSet = o2;
+                    method_setImplementation(m2, (IMP)WXNBadgeSetHook);
+                    WXN_ALOG(@"[角标探针] 已挂 +setApplicationIconBadgeNumber:");
+                }
+            } else {
+                WXN_ALOG(@"[角标探针] 没有 +setApplicationIconBadgeNumber:");
+            }
+        }
+    }
+
     return any;
 }
 
@@ -1702,6 +1741,22 @@ static void WXNBadgeSyncToUnread(NSString *why) {
 static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
     if (gOrigUnReadChange) ((void (*)(id, SEL, id))gOrigUnReadChange)(self, _cmd, a1);
     WXNBadgeSyncToUnread(@"UnReadChange");
+}
+
+// 2.34：角标真链探针
+static void WXNIconCountChangeHook(id self, SEL _cmd, id note) {
+    WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 触发 note=%@ self=%@",
+             note ? NSStringFromClass([note class]) : @"(nil)",
+             self ? NSStringFromClass(object_getClass(self)) : @"?");
+    if (gOrigIconCountChange) ((void (*)(id, SEL, id))gOrigIconCountChange)(self, _cmd, note);
+    WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 处理完，当前采样 unread=%ld",
+             (long)WXNUnreadTotal());
+}
+
+static void WXNBadgeSetHook(id self, SEL _cmd, NSInteger n) {
+    WXN_ALOG(@"[角标探针] +setApplicationIconBadgeNumber:%ld（%@）", (long)n,
+             self ? NSStringFromClass((Class)self) : @"?");
+    if (gOrigBadgeSet) ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)(self, _cmd, n);
 }
 
 // 2.30：未读数侦察——找微信内部"总未读"的真实来源，
