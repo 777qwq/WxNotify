@@ -1701,20 +1701,36 @@ static double gEnteredWeChatAt = 0;
 static double gLastProbeAt = 0;
 
 static void WXNProbeOnLeave(void) {
-    if (!WXNDebug()) return;
-    double now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastProbeAt < 120.0) return;
-    gLastProbeAt = now;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        WXN_ALOG(@"探针：人已离开微信，投一条测试通知，看横幅画不画得出来");
-        // 走和真实消息一样的路（翻认知 → 投递），所以它会响，不会静悄悄飘过去
-        WXNBeginFakeBackground(@"前台探针");
-        WXNPost([@"wxn-probe-" stringByAppendingString:[[NSUUID UUID] UUIDString]],
-                @"前台探针", nil,
-                @"看到这条横幅，说明离开微信后能弹了。",
-                @"wxn-probe", nil, NO);
-    });
+    // 2.57：MMKV 账本探针——真身 m_pushInfos（MemoryMappedKV）的条目数
+    // 可能就是未读数（按会话持久化的待推送账本，读掉会清条目）。
+    @try {
+        if (!gLN) { WXN_ALOG(@"[MMKV] LN 未就绪"); return; }
+        id real = gLN;
+        Class realCls = NSClassFromString(@"MMLocalNotificationMgr");
+        if (![real isKindOfClass:realCls]) {
+            id inner = nil;
+            unsigned int n = 0;
+            Ivar *ivs = class_copyIvarList(object_getClass(gLN), &n);
+            for (unsigned int i = 0; i < n; i++) {
+                const char *nm = ivar_getName(ivs[i]);
+                if (nm && strcmp(nm, "m_service") == 0) {
+                    inner = object_getIvar(gLN, ivs[i]);
+                    break;
+                }
+            }
+            if (ivs) free(ivs);
+            if (inner && [inner isKindOfClass:realCls]) real = inner;
+            else { WXN_ALOG(@"[MMKV] 真身解引用失败"); return; }
+        }
+        Ivar kvIvar = class_getInstanceVariable(realCls, "m_pushInfos");
+        if (!kvIvar) { WXN_ALOG(@"[MMKV] 没有 m_pushInfos"); return; }
+        id kv = object_getIvar(real, kvIvar);
+        if (!kv) { WXN_ALOG(@"[MMKV] pushInfos 为 nil"); return; }
+        unsigned long c = ((unsigned long (*)(id, SEL))objc_msgSend)(kv, @selector(count));
+        WXN_ALOG(@"[MMKV] pushInfos 条目数 = %lu", c);
+    } @catch (NSException *e) {
+        WXN_ALOG(@"[MMKV] 异常 %@", e);
+    }
 }
 
 static void WXNWatchFront(void) {
