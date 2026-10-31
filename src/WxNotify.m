@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.57"
+#define WXN_VERSION     "2.58"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -610,6 +610,9 @@ static NSNumber *WXNUnreadCount(void) {
 
 static NSInteger gBadge = -1;
 
+// 2.58：人在微信里收到的未读（微信认知=0 不写角标，退出时我们补写）
+static NSInteger gInAppUnread = 0;
+
 static NSString *WXNBadgePath(void) {
     NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     if (!dir.length) dir = NSTemporaryDirectory();
@@ -953,15 +956,6 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
         return;
     }
 
-    // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
-    if (!WXNShouldNotify()) {
-        WXN_ALOG(@"  跳过：前台判断为“人在微信里”");
-        return;
-    }
-
-    // 人不在微信里：真正要投递之前再翻它的认知（见 WXNBeginFakeBackground），
-    // 因为这里之后还可能因为“自己发的/免打扰/太旧/重复”而跳过
-
     // 自己发出去的消息不提醒
     Class wrapCls = NSClassFromString(@"CMessageWrap");
     if (wrapCls && [(id)wrapCls respondsToSelector:@selector(isSenderFromMsgWrap:)]) {
@@ -978,6 +972,25 @@ static void WXNHandleMessage(id msgMgr, id wrap, NSString *where) {
     } else {
         WXN_ALOG(@"  注意：没有 +isSenderFromMsgWrap:，没法区分收发");
     }
+
+    // 人在微信里，或者微信已经正常退到后台（那边它自己会发）都不管
+    if (!WXNShouldNotify()) {
+        // 2.58：微信内来消息，微信不写角标，自己记一笔，退出时补写
+        unsigned int created = WXNUInt(wrap, @"m_uiCreateTime");
+        unsigned int localID = WXNUInt(wrap, @"m_uiMesLocalID");
+        long long svrID = WXNLongLong(wrap, @"m_n64MesSvrID");
+        NSString *sess = rawChat.length ? rawChat : rawFrom;
+        NSString *key = [NSString stringWithFormat:@"%@|%u|%lld|%u", sess ?: @"", localID, svrID, created];
+        if (!WXNSeenBefore(key)) {
+            gInAppUnread++;
+            WXN_ALOG(@"  微信内未读 +1（计 %ld）", (long)gInAppUnread);
+        }
+        WXN_ALOG(@"  跳过：前台判断为“人在微信里”");
+        return;
+    }
+
+    // 人不在微信里：真正要投递之前再翻它的认知（见 WXNBeginFakeBackground），
+    // 因为这里之后还可能因为“自己发的/免打扰/太旧/重复”而跳过
 
     // 冷启动补拉历史消息时会灌一堆，超过两分钟的直接丢掉
     unsigned int created = WXNUInt(wrap, @"m_uiCreateTime");
@@ -1717,6 +1730,25 @@ static void WXNProbeOnLeave(void) {
         if (!kv) { WXN_ALOG(@"[MMKV] pushInfos 为 nil"); return; }
         unsigned long c = ((unsigned long (*)(id, SEL))objc_msgSend)(kv, @selector(count));
         WXN_ALOG(@"[MMKV] pushInfos 条目数 = %lu", c);
+        // 2.58：抓前 3 个键对应的条目，看有没有每会话未读字段
+        NSMutableArray *keys = [NSMutableArray array];
+        void (^enumBlk)(NSString *, BOOL *) = ^(NSString *k, BOOL *stop) {
+            if (k.length && keys.count < 3) [keys addObject:k];
+            if (keys.count >= 3) *stop = YES;
+        };
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(kv, @selector(enumerateKeys:), enumBlk);
+        } @catch (NSException *e) { WXN_ALOG(@"[MMKV] enumerateKeys 异常 %@", e); }
+        for (NSString *k in keys) {
+            id obj = nil;
+            @try {
+                obj = ((id (*)(id, SEL, Class, id))objc_msgSend)(kv, @selector(getObjectOfClass:forKey:),
+                                                                 [NSObject class], k);
+            } @catch (NSException *e) { WXN_ALOG(@"[MMKV] objectForKey 异常 %@", e); }
+            NSString *desc = obj ? [obj description] : @"(nil)";
+            if (desc.length > 400) desc = [desc substringToIndex:400];
+            WXN_ALOG(@"[MMKV] 键 %@ -> %@", k, desc);
+        }
     } @catch (NSException *e) {
         WXN_ALOG(@"[MMKV] 异常 %@", e);
     }
@@ -1731,8 +1763,19 @@ static void WXNWatchFront(void) {
             WXN_ALOG(@"前台变化：%@（%@）", in ? @"回到微信" : @"离开微信", why ?: @"");
             if (in) {
                 gEnteredWeChatAt = CFAbsoluteTimeGetCurrent();
+                gInAppUnread = 0;
                 WXNClearBadgeNow(@"回到微信", YES);
             } else {
+                // 2.58：退出时把微信内攒的未读写上角标
+                if (gInAppUnread > 0) {
+                    if (gBadge < 0) gBadge = 0;
+                    gBadge += gInAppUnread;
+                    WXNBadgeWrite();
+                    UIApplication *app = [UIApplication sharedApplication];
+                    if (app) @try { [app setApplicationIconBadgeNumber:gBadge]; } @catch (__unused NSException *e) {}
+                    WXN_ALOG(@"离开微信：微信内未读 %ld 写上角标（总 %ld）", (long)gInAppUnread, (long)gBadge);
+                    gInAppUnread = 0;
+                }
                 WXNProbeOnLeave();
             }
         }
@@ -1783,38 +1826,6 @@ static void WXNSetupWithRetry(int attempt) {
 
 // 诊断：notifyutil -p cn.qwq.wxnotify.diag
 // 把环境、钩子、权限、Immortalizer 开关全写进日志文件
-static void WXNPostBootOnce(void) {
-    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    if (!docs.count) return;
-    NSString *marker = [docs[0] stringByAppendingPathComponent:
-                                   [@".wxn_boot_" stringByAppendingString:@WXN_VERSION]];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:marker]) return;
-    if (![@"1" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL]) return;
-
-    gForceNextBanner = YES;
-    NSString *where = WXNLogPath() ?: @"(日志没写成功)";
-    WXN_ALOG(@"首次启动，投一条自检通知：%@", where);
-
-    // 两条间隔 2 秒：一条在微信里（走 willPresent 强制），一条应当直接当普通通知弹
-    for (int i = 0; i < 2; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-                           WXNPost([NSString stringWithFormat:@"wxn-boot-%d-%@", i,
-                                    [[NSUUID UUID] UUIDString]],
-                                   [NSString stringWithFormat:@"WxNotify %s 已加载", WXN_VERSION],
-                                   nil,
-                                   [NSString stringWithFormat:@"第 %d 条。收到消息会补发横幅。日志：%@",
-                                    i + 1, where],
-                                   @"wxn-boot", nil, NO);
-                       });
-    }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                       gForceNextBanner = NO;
-                   });
-}
 
 // 再补一层零风险的探针：只听系统广播，不改任何行为。
 // 注意：只有“离开”类广播才算证据（known=1），回来类广播满天飞（启动时就一堆），
@@ -2129,7 +2140,6 @@ static void WXNInit(void) {
                    dispatch_get_main_queue(), ^{
                        WXNInstallCognitionHooks();
                        WXNSetupPresentationHooks();
-                       if (WXNDebug()) WXNPostBootOnce();
                    });
 
     // 20 秒再补一次，顺便把可能还没起来的 MMLocalNotificationMgr 抓到手
