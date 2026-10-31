@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.39"
+#define WXN_VERSION     "2.40"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1311,26 +1311,17 @@ static BOOL gWeChatWroteBadge = NO;   // 窗口期内微信是否自己写过角
 static void WXNNativeExitCleanup(void) {
     if (!gLN || !gLNIsBG) return;           // 认知干预没启用就不碰
     WXNCognitionForce(YES);                  // 复位成真实后台
-    gWeChatWroteBadge = NO;
-    WXN_ALOG(@"[退出清理] 诚实窗口开启 2s（等微信自己清）");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                       WXNCognitionForce(NO);   // 恢复保活伪装
-                       if (gWeChatWroteBadge) {
-                           WXN_ALOG(@"[退出清理] 微信窗口期内自己写了角标，收手");
-                           return;
-                       }
-                       long unread = (long)WXNUnreadTotal();
-                       if (unread < 0) unread = 0;
-                       Class nam = NSClassFromString(@"NotificationActionsMgr");
-                       if (!nam || !gOrigBadgeSet) return;
-                       WXN_ALOG(@"[退出清理] 微信没动，代笔：角标写 %ld", unread);
-                       @try {
-                           ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), (NSInteger)unread);
-                       } @catch (NSException *e) {
-                           WXN_ALOG(@"[退出清理] 异常 %@", e);
-                       }
-                   });
+    // 2.40：诚实窗口已证伪（回调型感知），离开即刻代笔
+    long unread = (long)WXNUnreadTotal();
+    if (unread < 0) unread = 0;
+    Class nam = NSClassFromString(@"NotificationActionsMgr");
+    if (!nam || !gOrigBadgeSet) return;
+    WXN_ALOG(@"[退出清理] 离开即刻代笔：角标写 %ld", unread);
+    @try {
+        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), (NSInteger)unread);
+    } @catch (NSException *e) {
+        WXN_ALOG(@"[退出清理] 异常 %@", e);
+    }
 }
 
 static void WXNCognitionRestore(void) {
@@ -1734,13 +1725,19 @@ static BOOL gWasInWeChat = NO;
 // 2.15：走到别的 App 时自动投一条探针，专验证那件还没验证的事——
 // 微信被 Immortalizer 认定为前台时，willPresent 里返回 Banner 到底画不画得出来。
 // 2.31：角标跟真实未读——读 CMessageMgr 的 GetUnReadCount，写到图标角标。
+// 2.40：诚实窗口已被实证证伪（两轮离开窗口内微信零动作，回调型感知），
+// 撤掉等待，离开即刻代笔；采样失败必须打出异常详情（不能再吞）。
 static NSInteger WXNTryUnread(id obj) {
     if (!obj) return -1;
     // 2.33：不信 respondsToSelector——MMServiceWrapper 靠 ObjC 转发响应服务方法，
     // 问它"有没有"永远是 NO，直接发，转发机制自己会兜
     @try {
         return (NSInteger)((unsigned int (*)(id, SEL))objc_msgSend)(obj, @selector(GetUnReadCount));
-    } @catch (__unused NSException *e) { return -1; }
+    } @catch (NSException *e) {
+        WXN_ALOG(@"[未读采样] GetUnReadCount 异常 obj=%@ reason=%@",
+                 NSStringFromClass(object_getClass(obj)), e);
+        return -1;
+    }
 }
 
 static id gMsgMgrReal = nil;
