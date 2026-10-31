@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.37"
+#define WXN_VERSION     "2.38"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1303,27 +1303,24 @@ static void WXNCognitionForce(BOOL bg) {
     WXN_ALOG(@"微信的认知：m_isInBackground = %d", (int)bg);
 }
 
-// 2.37：交还原主——开保活时微信感知不到"用户离开"，原生退出清理链
-// （closeMainFrameWithoutReset → 清角标）从不执行。我们用 SBSCopy 的可靠
-// 离开事件，复位认知后触发微信自己的原版清理，不自己写清零逻辑。
+static NSInteger WXNUnreadTotal(void);
+// 2.38：外科手术版——2.37 直接调 closeMainFrameWithoutReset 会拆主界面状态，
+// 强杀退出时微信二次走退出流程撞死锁（0x8BADF00D watchdog）。改为只复刻
+// 退出链对角标的那个动作：用微信自己的未读计数写一次角标（原生清零+未读
+// 同步的最终效果 = 角标=当前未读数），不碰 UI 状态。
 static void WXNNativeExitCleanup(void) {
     if (!gLN || !gLNIsBG) return;           // 认知干预没启用就不碰
     WXNCognitionForce(YES);                  // 复位成真实后台
-    UIApplication *app = [UIApplication sharedApplication];
-    id ad = app ? app.delegate : nil;
-    Class adCls = NSClassFromString(@"MicroMessengerAppDelegate");
-    if (!ad || !adCls || ![ad isKindOfClass:adCls]) {
-        WXN_ALOG(@"[退出清理] 拿不到 AppDelegate（ad=%@）", ad ? NSStringFromClass(object_getClass(ad)) : @"nil");
+    long unread = (long)WXNUnreadTotal();
+    if (unread < 0) unread = 0;              // 采样失败按原生清零处理
+    Class nam = NSClassFromString(@"NotificationActionsMgr");
+    if (!nam || !gOrigBadgeSet) {
+        WXN_ALOG(@"[退出清理] NotificationActionsMgr 探针未就绪，跳过");
         return;
     }
-    SEL sel = NSSelectorFromString(@"closeMainFrameWithoutReset");
-    if (![ad respondsToSelector:sel]) {
-        WXN_ALOG(@"[退出清理] AppDelegate 不吃 closeMainFrameWithoutReset");
-        return;
-    }
-    WXN_ALOG(@"[退出清理] 离开事件 → 触发原生 closeMainFrameWithoutReset");
+    WXN_ALOG(@"[退出清理] 离开事件 → 原生角标写 %ld（微信自己的未读计数）", unread);
     @try {
-        ((void (*)(id, SEL))objc_msgSend)(ad, sel);
+        ((void (*)(id, SEL, NSInteger))gOrigBadgeSet)((id)nam, @selector(setApplicationIconBadgeNumber:), (NSInteger)unread);
     } @catch (NSException *e) {
         WXN_ALOG(@"[退出清理] 异常 %@", e);
     }
