@@ -40,7 +40,7 @@
 
 #include <time.h>
 #define WXN_BUNDLE_ID   "com.tencent.xin"
-#define WXN_VERSION     "2.34"
+#define WXN_VERSION     "2.35"
 #define WXN_PREF_PATH   "/var/mobile/Library/Preferences/cn.qwq.wxnotify.plist"
 #define WXN_CHANGED_NOT "cn.qwq.wxnotify.changed"
 // 2.17：放一个空文件就开日志（Filza 里新建），删掉就关
@@ -1744,11 +1744,12 @@ static void WXNUnReadChangeHook(id self, SEL _cmd, id a1) {
 }
 
 // 2.34：角标真链探针
-static void WXNIconCountChangeHook(id self, SEL _cmd, id note) {
-    WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 触发 note=%@ self=%@",
-             note ? NSStringFromClass([note class]) : @"(nil)",
+// 2.35：参数不是 ObjC 对象（反汇编 ldr w10,[x0,#0x20] 是整数），绝不能碰。
+// 只打"触发了"，盲转发原始寄存器。
+static void WXNIconCountChangeHook(id self, SEL _cmd, void *a1) {
+    WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 触发（参数不解析）self=%@",
              self ? NSStringFromClass(object_getClass(self)) : @"?");
-    if (gOrigIconCountChange) ((void (*)(id, SEL, id))gOrigIconCountChange)(self, _cmd, note);
+    if (gOrigIconCountChange) ((void (*)(id, SEL, void *))gOrigIconCountChange)(self, _cmd, a1);
     WXN_ALOG(@"[角标探针] onAppIconTotalUnreadCountChange: 处理完，当前采样 unread=%ld",
              (long)WXNUnreadTotal());
 }
