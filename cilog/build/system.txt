@@ -1,0 +1,8 @@
+2026-10-31T11:04:17.4960000Z Evaluating build.if
+2026-10-31T11:04:17.4960000Z Evaluating: success()
+2026-10-31T11:04:17.4960000Z Result: true
+2026-10-31T11:04:17.4950000Z Requested labels: macos-14
+2026-10-31T11:04:17.4950000Z Job defined at: 777qwq/WxNotify/.github/workflows/build.yml@refs/heads/main
+2026-10-31T11:04:17.4950000Z Waiting for a runner to pick up this job...
+2026-10-31T11:04:17.9830000Z Job is about to start running on the hosted runner: GitHub Actions 1000003227
+2026-10-31T11:04:17.9830000Z Job is waiting for a hosted runner to come online.

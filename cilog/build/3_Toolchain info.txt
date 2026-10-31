@@ -1,0 +1,10 @@
+﻿2026-10-31T11:04:21.0530980Z ##[group]Run xcodebuild -version
+2026-10-31T11:04:21.0532140Z [36;1mxcodebuild -version[0m
+2026-10-31T11:04:21.0533070Z [36;1mxcrun --sdk iphoneos --show-sdk-version[0m
+2026-10-31T11:04:21.0534540Z [36;1mSDK=$(xcrun --sdk iphoneos --show-sdk-path); echo "SDK=$SDK"[0m
+2026-10-31T11:04:21.0590420Z shell: /bin/bash -e {0}
+2026-10-31T11:04:21.0591200Z ##[endgroup]
+2026-10-31T11:04:21.2358340Z Xcode 15.4
+2026-10-31T11:04:21.2360480Z Build version 15F31d
+2026-10-31T11:04:22.6488200Z 17.5
+2026-10-31T11:04:22.6522770Z SDK=/Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk

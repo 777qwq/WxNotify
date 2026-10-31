@@ -48,21 +48,10 @@
 // 2.12：SpringBoard 侧守卫写的真·最前台状态
 #define WXN_FRONT_PATH  "/var/mobile/Library/Preferences/cn.qwq.wxnotify.front"
 
+static void WXNLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+
 // 总是记：加载、挂钩结果、投递失败这类
 #define WXN_ALOG(fmt, ...) WXNLog(fmt, ##__VA_ARGS__)
-
-// 2.27：诊断分体开关——Preferences 下放对应空文件就跳过那组钩子，
-// 用于二分定位"微信内无声"的肇事钩子组；删文件+注销即恢复全量。
-static BOOL WXNMarkerOff(const char *tag) {
-    static char cache[8][64]; static BOOL val[8]; static int n=0;
-    for (int i=0;i<n;i++) if (!strcmp(cache[i],tag)) return val[i];
-    char path[128];
-    snprintf(path,sizeof(path),"/var/mobile/Library/Preferences/cn.qwq.wxnotify.%s",tag);
-    BOOL off = [[NSFileManager defaultManager] fileExistsAtPath:@(path)];
-    if (n<8){ strncpy(cache[n],tag,63); val[n]=off; n++; }
-    if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
-    return off;
-}
 
 // 通知里显示的内容上限，防止超长消息把横幅撑爆
 #define WXN_BODY_MAX    240
@@ -1603,7 +1592,6 @@ static void WXNAddRequest(id self, SEL _cmd, id req, id handler) {
 }
 
 static void WXNSetupPresentationHooks(void) {
-    if (WXNMarkerOff("no_delegate")) return;   // 2.27 诊断分体
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
     if (!center) return;
 
@@ -2123,24 +2111,24 @@ static void WXNInit(void) {
         WXNLoadConfig();
     });
 
-    if (!WXNMarkerOff("no_ln")) WXNInstallLocalNotificationProbe();
-    if (!WXNMarkerOff("no_cog")) WXNInstallCognitionHooks();
+    WXNInstallLocalNotificationProbe();
+    WXNInstallCognitionHooks();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(__unused NSNotification *note) {
-        if (!WXNMarkerOff("no_badgeclear")) WXNClearBadgeNow(@"微信变成 active", YES);
+        WXNClearBadgeNow(@"微信变成 active", YES);
     }];
     WXNWatchFront();
-    if (!WXNMarkerOff("no_msg")) WXNInstallWithRetry(0);
-    if (!WXNMarkerOff("no_delegate")) WXNSetupWithRetry(0);
+    WXNInstallWithRetry(0);
+    WXNSetupWithRetry(0);
 
     // 8 秒补挂一次：有的版本类注册得晚，或者被别的插件盖回去了。
     // 自检通知只在这里、且只在 debug 打开时弹，日常版本一条都不弹。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       if (!WXNMarkerOff("no_cog")) WXNInstallCognitionHooks();
-                       if (!WXNMarkerOff("no_delegate")) WXNSetupPresentationHooks();
+                       WXNInstallCognitionHooks();
+                       WXNSetupPresentationHooks();
                        if (WXNDebug()) WXNPostBootOnce();
                    });
 
@@ -2148,6 +2136,6 @@ static void WXNInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        WXNTryGrabLN(@"启动 20 秒");
-                       if (!WXNMarkerOff("no_delegate")) WXNSetupPresentationHooks();
+                       WXNSetupPresentationHooks();
                    });
 }

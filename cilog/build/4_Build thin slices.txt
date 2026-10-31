@@ -1,0 +1,83 @@
+﻿2026-10-31T11:04:22.6553430Z ##[group]Run set -eux
+2026-10-31T11:04:22.6553670Z [36;1mset -eux[0m
+2026-10-31T11:04:22.6553880Z [36;1mSDK=$(xcrun --sdk iphoneos --show-sdk-path)[0m
+2026-10-31T11:04:22.6554120Z [36;1m[0m
+2026-10-31T11:04:22.6554290Z [36;1mfor ARCH in arm64 arm64e; do[0m
+2026-10-31T11:04:22.6554570Z [36;1m  clang -target ${ARCH}-apple-ios15.0 -isysroot "$SDK" \[0m
+2026-10-31T11:04:22.6554940Z [36;1m    -include stdlib.h -include string.h \[0m
+2026-10-31T11:04:22.6555250Z [36;1m    -fobjc-arc -O2 -dynamiclib -fno-omit-frame-pointer \[0m
+2026-10-31T11:04:22.6555710Z [36;1m    -framework UIKit -framework Foundation -framework UserNotifications -ldl \[0m
+2026-10-31T11:04:22.6556090Z [36;1m    -Wl,-undefined,dynamic_lookup \[0m
+2026-10-31T11:04:22.6556480Z [36;1m    -install_name /var/jb/Library/MobileSubstrate/DynamicLibraries/WxNotify.dylib \[0m
+2026-10-31T11:04:22.6556870Z [36;1m    -o WxNotify-${ARCH}.dylib src/WxNotify.m[0m
+2026-10-31T11:04:22.6557090Z [36;1mdone[0m
+2026-10-31T11:04:22.6557240Z [36;1m[0m
+2026-10-31T11:04:22.6557400Z [36;1mlipo -info *.dylib[0m
+2026-10-31T11:04:22.6557590Z [36;1mls -la *.dylib[0m
+2026-10-31T11:04:22.6557760Z [36;1mfor f in *.dylib; do[0m
+2026-10-31T11:04:22.6557940Z [36;1m  echo "==== $f"[0m
+2026-10-31T11:04:22.6558120Z [36;1m  otool -hv "$f" | tail -3[0m
+2026-10-31T11:04:22.6558470Z [36;1m  otool -l "$f" | grep -E "LC_BUILD_VERSION|LC_DYLD_CHAINED_FIXUPS|LC_DYLD_INFO_ONLY" || true[0m
+2026-10-31T11:04:22.6558820Z [36;1mdone[0m
+2026-10-31T11:04:22.6559170Z [36;1mecho "==== 私有类抽查"; (strings -a WxNotify-arm64.dylib | grep -c "CMessageMgr\|CContactMgr\|CMessageWrap" || true)[0m
+2026-10-31T11:04:22.6559730Z [36;1mecho "==== 钩子抽查"; (strings -a WxNotify-arm64.dylib | grep -c "AsyncOnAddMsgForSession" || true)[0m
+2026-10-31T11:04:22.6560290Z [36;1mecho "==== 前台判断"; (strings -a WxNotify-arm64.dylib | grep -c "SBSCopyFrontmostApplicationDisplayIdentifier" || true)[0m
+2026-10-31T11:04:22.6661890Z shell: /bin/bash -e {0}
+2026-10-31T11:04:22.6662120Z ##[endgroup]
+2026-10-31T11:04:22.6905980Z ++ xcrun --sdk iphoneos --show-sdk-path
+2026-10-31T11:04:22.6936210Z + SDK=/Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk
+2026-10-31T11:04:22.6936810Z + for ARCH in arm64 arm64e
+2026-10-31T11:04:22.6938330Z + clang -target arm64-apple-ios15.0 -isysroot /Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk -include stdlib.h -include string.h -fobjc-arc -O2 -dynamiclib -fno-omit-frame-pointer -framework UIKit -framework Foundation -framework UserNotifications -ldl -Wl,-undefined,dynamic_lookup -install_name /var/jb/Library/MobileSubstrate/DynamicLibraries/WxNotify.dylib -o WxNotify-arm64.dylib src/WxNotify.m
+2026-10-31T11:04:24.0468820Z src/WxNotify.m:63:14: error: call to undeclared function 'WXNLog'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+2026-10-31T11:04:24.0469800Z     if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
+2026-10-31T11:04:24.0470130Z              ^
+2026-10-31T11:04:24.0470350Z src/WxNotify.m:52:28: note: expanded from macro 'WXN_ALOG'
+2026-10-31T11:04:24.0470670Z #define WXN_ALOG(fmt, ...) WXNLog(fmt, ##__VA_ARGS__)
+2026-10-31T11:04:24.0470970Z                            ^
+2026-10-31T11:04:24.0496670Z src/WxNotify.m:141:13: error: static declaration of 'WXNLog' follows non-static declaration
+2026-10-31T11:04:24.0497400Z static void WXNLog(NSString *fmt, ...) {
+2026-10-31T11:04:24.0498370Z             ^
+2026-10-31T11:04:24.0499450Z src/WxNotify.m:63:14: note: previous implicit declaration is here
+2026-10-31T11:04:24.0500020Z     if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
+2026-10-31T11:04:24.0500350Z              ^
+2026-10-31T11:04:24.0500650Z src/WxNotify.m:52:28: note: expanded from macro 'WXN_ALOG'
+2026-10-31T11:04:24.0501020Z #define WXN_ALOG(fmt, ...) WXNLog(fmt, ##__VA_ARGS__)
+2026-10-31T11:04:24.0501350Z                            ^
+2026-10-31T11:04:24.0638260Z src/WxNotify.m:1335:74: warning: incompatible pointer types passing 'NSInteger (**)(__strong id, SEL)' (aka 'long (**)(__strong id, SEL *)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0639930Z         BOOL ok = WXNSwizzle(app, @"applicationState", (IMP)WXNAppState, &gOrigAppState);
+2026-10-31T11:04:24.0640310Z                                                                          ^~~~~~~~~~~~~~
+2026-10-31T11:04:24.0640690Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0641150Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0641530Z                                                                            ^
+2026-10-31T11:04:24.0643580Z src/WxNotify.m:1478:68: warning: incompatible pointer types passing 'BOOL (**)(__strong id, SEL)' (aka 'bool (**)(__strong id, SEL *)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0644540Z         WXNSwizzle(app, @"isForeground", (IMP)WXNIsForegroundHook, &gOrigIsForeground);
+2026-10-31T11:04:24.0645020Z                                                                    ^~~~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0645420Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0645860Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0646250Z                                                                            ^
+2026-10-31T11:04:24.0646950Z src/WxNotify.m:1485:73: warning: incompatible pointer types passing 'BOOL (**)(__strong id, SEL)' (aka 'bool (**)(__strong id, SEL *)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0647850Z         WXNSwizzle(mon, @"IsAppInBackground", (IMP)WXNAppMonitorBGHook, &gOrigAppMonitorBG);
+2026-10-31T11:04:24.0648330Z                                                                         ^~~~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0648730Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0649170Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0649560Z                                                                            ^
+2026-10-31T11:04:24.0650240Z src/WxNotify.m:1492:70: warning: incompatible pointer types passing 'id (**)(__strong id, SEL, __unsafe_unretained Class)' to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0651000Z     if (msc) WXNSwizzle(msc, @"getService:", (IMP)WXNGetServiceHook, &gOrigGetService);
+2026-10-31T11:04:24.0651380Z                                                                      ^~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0651740Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0652160Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0652560Z                                                                            ^
+2026-10-31T11:04:24.0653170Z src/WxNotify.m:1530:62: warning: incompatible pointer types passing 'void (**)(__strong id, SEL)' to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0653830Z     BOOL a = WXNSwizzle(c, @"onServiceInit", (IMP)WXNLNInit, &gOrigLNInit);
+2026-10-31T11:04:24.0654170Z                                                              ^~~~~~~~~~~~
+2026-10-31T11:04:24.0654740Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0655180Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0655560Z                                                                            ^
+2026-10-31T11:04:24.0656470Z src/WxNotify.m:1533:30: warning: incompatible pointer types passing 'void (**)(__strong id, SEL, __strong id, __strong id, __strong id, BOOL, BOOL)' (aka 'void (**)(__strong id, SEL *, __strong id, __strong id, __strong id, bool, bool)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0657540Z         (IMP)WXNLNShowPush3, &gOrigLNShowPush3);
+2026-10-31T11:04:24.0657810Z                              ^~~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0658130Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0658560Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0658940Z                                                                            ^
+2026-10-31T11:04:24.0684870Z 6 warnings and 2 errors generated.
+2026-10-31T11:04:24.0722990Z ##[error]Process completed with exit code 1.

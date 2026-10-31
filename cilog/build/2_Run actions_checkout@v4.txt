@@ -1,0 +1,74 @@
+﻿2026-10-31T11:04:19.7065930Z ##[group]Run actions/checkout@v4
+2026-10-31T11:04:19.7066540Z with:
+2026-10-31T11:04:19.7066850Z   repository: 777qwq/WxNotify
+2026-10-31T11:04:19.7069310Z   token: ***
+2026-10-31T11:04:19.7069620Z   ssh-strict: true
+2026-10-31T11:04:19.7069930Z   ssh-user: git
+2026-10-31T11:04:19.7070240Z   persist-credentials: true
+2026-10-31T11:04:19.7070590Z   clean: true
+2026-10-31T11:04:19.7070900Z   sparse-checkout-cone-mode: true
+2026-10-31T11:04:19.7071270Z   fetch-depth: 1
+2026-10-31T11:04:19.7071620Z   fetch-tags: false
+2026-10-31T11:04:19.7071950Z   show-progress: true
+2026-10-31T11:04:19.7072250Z   lfs: false
+2026-10-31T11:04:19.7072530Z   submodules: false
+2026-10-31T11:04:19.7072840Z   set-safe-directory: true
+2026-10-31T11:04:19.7073190Z   allow-unsafe-pr-checkout: false
+2026-10-31T11:04:19.7073650Z ##[endgroup]
+2026-10-31T11:04:20.0556900Z Syncing repository: 777qwq/WxNotify
+2026-10-31T11:04:20.0559110Z ##[group]Getting Git version info
+2026-10-31T11:04:20.0559760Z Working directory is '/Users/runner/work/WxNotify/WxNotify'
+2026-10-31T11:04:20.0560690Z [command]/opt/homebrew/bin/git version
+2026-10-31T11:04:20.0771320Z git version 2.55.0
+2026-10-31T11:04:20.0786740Z ##[endgroup]
+2026-10-31T11:04:20.0793500Z Copying '/Users/runner/.gitconfig' to '/Users/runner/work/_temp/b1ef8922-6812-4a3b-b335-e6e3c9612a45/.gitconfig'
+2026-10-31T11:04:20.0798550Z Temporarily overriding HOME='/Users/runner/work/_temp/b1ef8922-6812-4a3b-b335-e6e3c9612a45' before making global git config changes
+2026-10-31T11:04:20.0800670Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-31T11:04:20.0802000Z [command]/opt/homebrew/bin/git config --global --add safe.directory /Users/runner/work/WxNotify/WxNotify
+2026-10-31T11:04:20.0907630Z Deleting the contents of '/Users/runner/work/WxNotify/WxNotify'
+2026-10-31T11:04:20.0910190Z ##[group]Initializing the repository
+2026-10-31T11:04:20.0913460Z [command]/opt/homebrew/bin/git init /Users/runner/work/WxNotify/WxNotify
+2026-10-31T11:04:20.1115370Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-31T11:04:20.1117840Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-31T11:04:20.1119020Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-31T11:04:20.1119740Z hint: call:
+2026-10-31T11:04:20.1120190Z hint:
+2026-10-31T11:04:20.1120720Z hint: 	git config --global init.defaultBranch <name>
+2026-10-31T11:04:20.1121240Z hint:
+2026-10-31T11:04:20.1121790Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-31T11:04:20.1122670Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-31T11:04:20.1123360Z hint:
+2026-10-31T11:04:20.1140210Z hint: 	git branch -m <name>
+2026-10-31T11:04:20.1140670Z hint:
+2026-10-31T11:04:20.1141270Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-31T11:04:20.1142160Z Initialized empty Git repository in /Users/runner/work/WxNotify/WxNotify/.git/
+2026-10-31T11:04:20.1143790Z [command]/opt/homebrew/bin/git remote add origin https://github.com/777qwq/WxNotify
+2026-10-31T11:04:20.1193510Z ##[endgroup]
+2026-10-31T11:04:20.1194610Z ##[group]Disabling automatic garbage collection
+2026-10-31T11:04:20.1195520Z [command]/opt/homebrew/bin/git config --local gc.auto 0
+2026-10-31T11:04:20.1249000Z ##[endgroup]
+2026-10-31T11:04:20.1250920Z ##[group]Setting up auth
+2026-10-31T11:04:20.1254010Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-31T11:04:20.1326560Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-31T11:04:20.2122740Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-31T11:04:20.2162760Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-31T11:04:20.2646240Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-31T11:04:20.2685210Z [command]/opt/homebrew/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-31T11:04:20.3138620Z [command]/opt/homebrew/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-31T11:04:20.3182040Z ##[endgroup]
+2026-10-31T11:04:20.3182760Z ##[group]Fetching the repository
+2026-10-31T11:04:20.3186980Z [command]/opt/homebrew/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +f8af1f33bf8587fbe129e8d113306f7563019eec:refs/remotes/origin/main
+2026-10-31T11:04:20.9995030Z From https://github.com/777qwq/WxNotify
+2026-10-31T11:04:20.9996280Z  * [new ref]         f8af1f33bf8587fbe129e8d113306f7563019eec -> origin/main
+2026-10-31T11:04:20.9998530Z ##[endgroup]
+2026-10-31T11:04:20.9999380Z ##[group]Determining the checkout info
+2026-10-31T11:04:21.0000340Z ##[endgroup]
+2026-10-31T11:04:21.0002470Z [command]/opt/homebrew/bin/git sparse-checkout disable
+2026-10-31T11:04:21.0057000Z [command]/opt/homebrew/bin/git config --local --unset-all extensions.worktreeConfig
+2026-10-31T11:04:21.0104750Z ##[group]Checking out the ref
+2026-10-31T11:04:21.0107190Z [command]/opt/homebrew/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-10-31T11:04:21.0220250Z Switched to a new branch 'main'
+2026-10-31T11:04:21.0226100Z branch 'main' set up to track 'origin/main'.
+2026-10-31T11:04:21.0230470Z ##[endgroup]
+2026-10-31T11:04:21.0290660Z [command]/opt/homebrew/bin/git log -1 --format=%H
+2026-10-31T11:04:21.0331210Z f8af1f33bf8587fbe129e8d113306f7563019eec

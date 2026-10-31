@@ -1,0 +1,216 @@
+﻿2026-10-31T11:04:19.1181560Z Current runner version: '2.338.2'
+2026-10-31T11:04:19.1197150Z ##[group]Runner Image Provisioner
+2026-10-31T11:04:19.1197680Z Hosted Compute Agent
+2026-10-31T11:04:19.1198110Z Version: 20260828.587
+2026-10-31T11:04:19.1198530Z Commit: abac92662cab4cc7352de4f9f9d2e2419aad9c29
+2026-10-31T11:04:19.1199000Z Build Date: 2026-08-28T16:44:25Z
+2026-10-31T11:04:19.1199430Z Worker ID: {be28e3fb-98b2-4328-b6d1-9bf46ae41c71}
+2026-10-31T11:04:19.1199900Z Azure Region: westus
+2026-10-31T11:04:19.1200260Z ##[endgroup]
+2026-10-31T11:04:19.1201190Z ##[group]Operating System
+2026-10-31T11:04:19.1201550Z macOS
+2026-10-31T11:04:19.1201870Z 14.8.9
+2026-10-31T11:04:19.1202190Z 23J631
+2026-10-31T11:04:19.1202510Z ##[endgroup]
+2026-10-31T11:04:19.1202860Z ##[group]Runner Image
+2026-10-31T11:04:19.1203230Z Image: macos-14-arm64
+2026-10-31T11:04:19.1203590Z Version: 20260831.0302.1
+2026-10-31T11:04:19.1204430Z Included Software: https://github.com/actions/runner-images/blob/macos-14-arm64/20260831.0302/images/macos/macos-14-arm64-Readme.md
+2026-10-31T11:04:19.1205580Z Image Release: https://github.com/actions/runner-images/releases/tag/macos-14-arm64%2F20260831.0302
+2026-10-31T11:04:19.1206230Z ##[endgroup]
+2026-10-31T11:04:19.1206960Z ##[group]GITHUB_TOKEN Permissions
+2026-10-31T11:04:19.1208150Z Contents: write
+2026-10-31T11:04:19.1208520Z Metadata: read
+2026-10-31T11:04:19.1208870Z ##[endgroup]
+2026-10-31T11:04:19.1210220Z Secret source: Actions
+2026-10-31T11:04:19.1210770Z Cache mode: write
+2026-10-31T11:04:19.1211190Z Prepare workflow directory
+2026-10-31T11:04:19.1424470Z Prepare all required actions
+2026-10-31T11:04:19.1460180Z Getting action download info
+2026-10-31T11:04:19.2778230Z Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)
+2026-10-31T11:04:19.4941050Z Download action repository 'actions/upload-artifact@v4' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)
+2026-10-31T11:04:19.6605800Z Complete job name: build
+2026-10-31T11:04:19.7065950Z ##[group]Run actions/checkout@v4
+2026-10-31T11:04:19.7066550Z with:
+2026-10-31T11:04:19.7066860Z   repository: 777qwq/WxNotify
+2026-10-31T11:04:19.7069310Z   token: ***
+2026-10-31T11:04:19.7069620Z   ssh-strict: true
+2026-10-31T11:04:19.7069930Z   ssh-user: git
+2026-10-31T11:04:19.7070250Z   persist-credentials: true
+2026-10-31T11:04:19.7070590Z   clean: true
+2026-10-31T11:04:19.7070910Z   sparse-checkout-cone-mode: true
+2026-10-31T11:04:19.7071270Z   fetch-depth: 1
+2026-10-31T11:04:19.7071620Z   fetch-tags: false
+2026-10-31T11:04:19.7071950Z   show-progress: true
+2026-10-31T11:04:19.7072260Z   lfs: false
+2026-10-31T11:04:19.7072540Z   submodules: false
+2026-10-31T11:04:19.7072850Z   set-safe-directory: true
+2026-10-31T11:04:19.7073190Z   allow-unsafe-pr-checkout: false
+2026-10-31T11:04:19.7073650Z ##[endgroup]
+2026-10-31T11:04:20.0557000Z Syncing repository: 777qwq/WxNotify
+2026-10-31T11:04:20.0559130Z ##[group]Getting Git version info
+2026-10-31T11:04:20.0559840Z Working directory is '/Users/runner/work/WxNotify/WxNotify'
+2026-10-31T11:04:20.0560690Z [command]/opt/homebrew/bin/git version
+2026-10-31T11:04:20.0771400Z git version 2.55.0
+2026-10-31T11:04:20.0786780Z ##[endgroup]
+2026-10-31T11:04:20.0793510Z Copying '/Users/runner/.gitconfig' to '/Users/runner/work/_temp/b1ef8922-6812-4a3b-b335-e6e3c9612a45/.gitconfig'
+2026-10-31T11:04:20.0798580Z Temporarily overriding HOME='/Users/runner/work/_temp/b1ef8922-6812-4a3b-b335-e6e3c9612a45' before making global git config changes
+2026-10-31T11:04:20.0800680Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-31T11:04:20.0802020Z [command]/opt/homebrew/bin/git config --global --add safe.directory /Users/runner/work/WxNotify/WxNotify
+2026-10-31T11:04:20.0907700Z Deleting the contents of '/Users/runner/work/WxNotify/WxNotify'
+2026-10-31T11:04:20.0910210Z ##[group]Initializing the repository
+2026-10-31T11:04:20.0913470Z [command]/opt/homebrew/bin/git init /Users/runner/work/WxNotify/WxNotify
+2026-10-31T11:04:20.1115510Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-31T11:04:20.1117890Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-31T11:04:20.1119030Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-31T11:04:20.1119740Z hint: call:
+2026-10-31T11:04:20.1120190Z hint:
+2026-10-31T11:04:20.1120720Z hint: 	git config --global init.defaultBranch <name>
+2026-10-31T11:04:20.1121250Z hint:
+2026-10-31T11:04:20.1121790Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-31T11:04:20.1122670Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-31T11:04:20.1123360Z hint:
+2026-10-31T11:04:20.1140230Z hint: 	git branch -m <name>
+2026-10-31T11:04:20.1140680Z hint:
+2026-10-31T11:04:20.1141270Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-31T11:04:20.1142190Z Initialized empty Git repository in /Users/runner/work/WxNotify/WxNotify/.git/
+2026-10-31T11:04:20.1143790Z [command]/opt/homebrew/bin/git remote add origin https://github.com/777qwq/WxNotify
+2026-10-31T11:04:20.1193560Z ##[endgroup]
+2026-10-31T11:04:20.1194610Z ##[group]Disabling automatic garbage collection
+2026-10-31T11:04:20.1195520Z [command]/opt/homebrew/bin/git config --local gc.auto 0
+2026-10-31T11:04:20.1249060Z ##[endgroup]
+2026-10-31T11:04:20.1250950Z ##[group]Setting up auth
+2026-10-31T11:04:20.1254020Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-31T11:04:20.1326650Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-31T11:04:20.2122800Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-31T11:04:20.2163460Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-31T11:04:20.2646310Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-31T11:04:20.2685260Z [command]/opt/homebrew/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-31T11:04:20.3138710Z [command]/opt/homebrew/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-31T11:04:20.3182080Z ##[endgroup]
+2026-10-31T11:04:20.3182760Z ##[group]Fetching the repository
+2026-10-31T11:04:20.3187000Z [command]/opt/homebrew/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +f8af1f33bf8587fbe129e8d113306f7563019eec:refs/remotes/origin/main
+2026-10-31T11:04:20.9995080Z From https://github.com/777qwq/WxNotify
+2026-10-31T11:04:20.9996340Z  * [new ref]         f8af1f33bf8587fbe129e8d113306f7563019eec -> origin/main
+2026-10-31T11:04:20.9998540Z ##[endgroup]
+2026-10-31T11:04:20.9999380Z ##[group]Determining the checkout info
+2026-10-31T11:04:21.0000340Z ##[endgroup]
+2026-10-31T11:04:21.0002490Z [command]/opt/homebrew/bin/git sparse-checkout disable
+2026-10-31T11:04:21.0057030Z [command]/opt/homebrew/bin/git config --local --unset-all extensions.worktreeConfig
+2026-10-31T11:04:21.0104780Z ##[group]Checking out the ref
+2026-10-31T11:04:21.0107200Z [command]/opt/homebrew/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-10-31T11:04:21.0220300Z Switched to a new branch 'main'
+2026-10-31T11:04:21.0226110Z branch 'main' set up to track 'origin/main'.
+2026-10-31T11:04:21.0230480Z ##[endgroup]
+2026-10-31T11:04:21.0290690Z [command]/opt/homebrew/bin/git log -1 --format=%H
+2026-10-31T11:04:21.0331230Z f8af1f33bf8587fbe129e8d113306f7563019eec
+2026-10-31T11:04:21.0531010Z ##[group]Run xcodebuild -version
+2026-10-31T11:04:21.0532150Z [36;1mxcodebuild -version[0m
+2026-10-31T11:04:21.0533070Z [36;1mxcrun --sdk iphoneos --show-sdk-version[0m
+2026-10-31T11:04:21.0534550Z [36;1mSDK=$(xcrun --sdk iphoneos --show-sdk-path); echo "SDK=$SDK"[0m
+2026-10-31T11:04:21.0590430Z shell: /bin/bash -e {0}
+2026-10-31T11:04:21.0591210Z ##[endgroup]
+2026-10-31T11:04:21.2358420Z Xcode 15.4
+2026-10-31T11:04:21.2360490Z Build version 15F31d
+2026-10-31T11:04:22.6488230Z 17.5
+2026-10-31T11:04:22.6522780Z SDK=/Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk
+2026-10-31T11:04:22.6553430Z ##[group]Run set -eux
+2026-10-31T11:04:22.6553670Z [36;1mset -eux[0m
+2026-10-31T11:04:22.6553880Z [36;1mSDK=$(xcrun --sdk iphoneos --show-sdk-path)[0m
+2026-10-31T11:04:22.6554120Z [36;1m[0m
+2026-10-31T11:04:22.6554290Z [36;1mfor ARCH in arm64 arm64e; do[0m
+2026-10-31T11:04:22.6554570Z [36;1m  clang -target ${ARCH}-apple-ios15.0 -isysroot "$SDK" \[0m
+2026-10-31T11:04:22.6554940Z [36;1m    -include stdlib.h -include string.h \[0m
+2026-10-31T11:04:22.6555250Z [36;1m    -fobjc-arc -O2 -dynamiclib -fno-omit-frame-pointer \[0m
+2026-10-31T11:04:22.6555710Z [36;1m    -framework UIKit -framework Foundation -framework UserNotifications -ldl \[0m
+2026-10-31T11:04:22.6556090Z [36;1m    -Wl,-undefined,dynamic_lookup \[0m
+2026-10-31T11:04:22.6556490Z [36;1m    -install_name /var/jb/Library/MobileSubstrate/DynamicLibraries/WxNotify.dylib \[0m
+2026-10-31T11:04:22.6556870Z [36;1m    -o WxNotify-${ARCH}.dylib src/WxNotify.m[0m
+2026-10-31T11:04:22.6557090Z [36;1mdone[0m
+2026-10-31T11:04:22.6557260Z [36;1m[0m
+2026-10-31T11:04:22.6557400Z [36;1mlipo -info *.dylib[0m
+2026-10-31T11:04:22.6557590Z [36;1mls -la *.dylib[0m
+2026-10-31T11:04:22.6557760Z [36;1mfor f in *.dylib; do[0m
+2026-10-31T11:04:22.6557950Z [36;1m  echo "==== $f"[0m
+2026-10-31T11:04:22.6558120Z [36;1m  otool -hv "$f" | tail -3[0m
+2026-10-31T11:04:22.6558470Z [36;1m  otool -l "$f" | grep -E "LC_BUILD_VERSION|LC_DYLD_CHAINED_FIXUPS|LC_DYLD_INFO_ONLY" || true[0m
+2026-10-31T11:04:22.6558820Z [36;1mdone[0m
+2026-10-31T11:04:22.6559170Z [36;1mecho "==== 私有类抽查"; (strings -a WxNotify-arm64.dylib | grep -c "CMessageMgr\|CContactMgr\|CMessageWrap" || true)[0m
+2026-10-31T11:04:22.6559730Z [36;1mecho "==== 钩子抽查"; (strings -a WxNotify-arm64.dylib | grep -c "AsyncOnAddMsgForSession" || true)[0m
+2026-10-31T11:04:22.6560310Z [36;1mecho "==== 前台判断"; (strings -a WxNotify-arm64.dylib | grep -c "SBSCopyFrontmostApplicationDisplayIdentifier" || true)[0m
+2026-10-31T11:04:22.6661900Z shell: /bin/bash -e {0}
+2026-10-31T11:04:22.6662130Z ##[endgroup]
+2026-10-31T11:04:22.6906020Z ++ xcrun --sdk iphoneos --show-sdk-path
+2026-10-31T11:04:22.6936220Z + SDK=/Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk
+2026-10-31T11:04:22.6936810Z + for ARCH in arm64 arm64e
+2026-10-31T11:04:22.6938330Z + clang -target arm64-apple-ios15.0 -isysroot /Applications/Xcode_15.4.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk -include stdlib.h -include string.h -fobjc-arc -O2 -dynamiclib -fno-omit-frame-pointer -framework UIKit -framework Foundation -framework UserNotifications -ldl -Wl,-undefined,dynamic_lookup -install_name /var/jb/Library/MobileSubstrate/DynamicLibraries/WxNotify.dylib -o WxNotify-arm64.dylib src/WxNotify.m
+2026-10-31T11:04:24.0468860Z src/WxNotify.m:63:14: error: call to undeclared function 'WXNLog'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+2026-10-31T11:04:24.0469860Z     if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
+2026-10-31T11:04:24.0470130Z              ^
+2026-10-31T11:04:24.0470350Z src/WxNotify.m:52:28: note: expanded from macro 'WXN_ALOG'
+2026-10-31T11:04:24.0470670Z #define WXN_ALOG(fmt, ...) WXNLog(fmt, ##__VA_ARGS__)
+2026-10-31T11:04:24.0470970Z                            ^
+2026-10-31T11:04:24.0496690Z src/WxNotify.m:141:13: error: static declaration of 'WXNLog' follows non-static declaration
+2026-10-31T11:04:24.0497400Z static void WXNLog(NSString *fmt, ...) {
+2026-10-31T11:04:24.0498380Z             ^
+2026-10-31T11:04:24.0499450Z src/WxNotify.m:63:14: note: previous implicit declaration is here
+2026-10-31T11:04:24.0500020Z     if (off) WXN_ALOG(@"[分体开关] %s 组钩子已由标记文件跳过", tag);
+2026-10-31T11:04:24.0500350Z              ^
+2026-10-31T11:04:24.0500650Z src/WxNotify.m:52:28: note: expanded from macro 'WXN_ALOG'
+2026-10-31T11:04:24.0501020Z #define WXN_ALOG(fmt, ...) WXNLog(fmt, ##__VA_ARGS__)
+2026-10-31T11:04:24.0501350Z                            ^
+2026-10-31T11:04:24.0639050Z src/WxNotify.m:1335:74: warning: incompatible pointer types passing 'NSInteger (**)(__strong id, SEL)' (aka 'long (**)(__strong id, SEL *)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0639930Z         BOOL ok = WXNSwizzle(app, @"applicationState", (IMP)WXNAppState, &gOrigAppState);
+2026-10-31T11:04:24.0640310Z                                                                          ^~~~~~~~~~~~~~
+2026-10-31T11:04:24.0640690Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0641150Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0641530Z                                                                            ^
+2026-10-31T11:04:24.0643600Z src/WxNotify.m:1478:68: warning: incompatible pointer types passing 'BOOL (**)(__strong id, SEL)' (aka 'bool (**)(__strong id, SEL *)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0644550Z         WXNSwizzle(app, @"isForeground", (IMP)WXNIsForegroundHook, &gOrigIsForeground);
+2026-10-31T11:04:24.0645020Z                                                                    ^~~~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0645420Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0645870Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0646250Z                                                                            ^
+2026-10-31T11:04:24.0646950Z src/WxNotify.m:1485:73: warning: incompatible pointer types passing 'BOOL (**)(__strong id, SEL)' (aka 'bool (**)(__strong id, SEL *)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0647850Z         WXNSwizzle(mon, @"IsAppInBackground", (IMP)WXNAppMonitorBGHook, &gOrigAppMonitorBG);
+2026-10-31T11:04:24.0648340Z                                                                         ^~~~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0648730Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0649180Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0649560Z                                                                            ^
+2026-10-31T11:04:24.0650240Z src/WxNotify.m:1492:70: warning: incompatible pointer types passing 'id (**)(__strong id, SEL, __unsafe_unretained Class)' to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0651000Z     if (msc) WXNSwizzle(msc, @"getService:", (IMP)WXNGetServiceHook, &gOrigGetService);
+2026-10-31T11:04:24.0651380Z                                                                      ^~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0651740Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0652170Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0652560Z                                                                            ^
+2026-10-31T11:04:24.0653170Z src/WxNotify.m:1530:62: warning: incompatible pointer types passing 'void (**)(__strong id, SEL)' to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0653830Z     BOOL a = WXNSwizzle(c, @"onServiceInit", (IMP)WXNLNInit, &gOrigLNInit);
+2026-10-31T11:04:24.0654170Z                                                              ^~~~~~~~~~~~
+2026-10-31T11:04:24.0654740Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0655180Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0655560Z                                                                            ^
+2026-10-31T11:04:24.0656590Z src/WxNotify.m:1533:30: warning: incompatible pointer types passing 'void (**)(__strong id, SEL, __strong id, __strong id, __strong id, BOOL, BOOL)' (aka 'void (**)(__strong id, SEL *, __strong id, __strong id, __strong id, bool, bool)') to parameter of type 'IMP *' (aka 'void (**)(void)') [-Wincompatible-pointer-types]
+2026-10-31T11:04:24.0657550Z         (IMP)WXNLNShowPush3, &gOrigLNShowPush3);
+2026-10-31T11:04:24.0657810Z                              ^~~~~~~~~~~~~~~~~
+2026-10-31T11:04:24.0658130Z src/WxNotify.m:1153:76: note: passing argument to parameter 'outOrig' here
+2026-10-31T11:04:24.0658560Z static BOOL WXNSwizzle(Class cls, NSString *selName, IMP replacement, IMP *outOrig) {
+2026-10-31T11:04:24.0658940Z                                                                            ^
+2026-10-31T11:04:24.0684900Z 6 warnings and 2 errors generated.
+2026-10-31T11:04:24.0723010Z ##[error]Process completed with exit code 1.
+2026-10-31T11:04:24.0829150Z Post job cleanup.
+2026-10-31T11:04:24.1716730Z [command]/opt/homebrew/bin/git version
+2026-10-31T11:04:24.1757540Z git version 2.55.0
+2026-10-31T11:04:24.1773080Z Copying '/Users/runner/.gitconfig' to '/Users/runner/work/_temp/433c18f8-19af-4de9-9dba-3e3d5bdf9aa9/.gitconfig'
+2026-10-31T11:04:24.1777980Z Temporarily overriding HOME='/Users/runner/work/_temp/433c18f8-19af-4de9-9dba-3e3d5bdf9aa9' before making global git config changes
+2026-10-31T11:04:24.1779040Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-31T11:04:24.1781230Z [command]/opt/homebrew/bin/git config --global --add safe.directory /Users/runner/work/WxNotify/WxNotify
+2026-10-31T11:04:24.1828280Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-31T11:04:24.1869280Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-31T11:04:24.2324670Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-31T11:04:24.2357310Z http.https://github.com/.extraheader
+2026-10-31T11:04:24.2362620Z [command]/opt/homebrew/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-31T11:04:24.2400830Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-31T11:04:24.2844640Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-31T11:04:24.2879470Z [command]/opt/homebrew/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-31T11:04:24.3396470Z Cleaning up orphan processes
+2026-10-31T11:04:24.3490390Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
